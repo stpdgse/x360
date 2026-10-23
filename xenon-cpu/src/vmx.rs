@@ -183,6 +183,23 @@ pub(crate) fn vx_float(xo: u32, a: u128, b: u128, va: usize) -> Option<u128> {
             let w = b.to_be_bytes();
             from_f4(std::array::from_fn(|i| i32::from_be_bytes(w[4 * i..4 * i + 4].try_into().unwrap()) as f32 * scale))
         }
+        778 => {
+            // vcfux: unsigned int -> float, scaled by 2^-UIMM
+            let scale = 1.0 / (1u64 << (va & 31)) as f32;
+            let w = b.to_be_bytes();
+            from_f4(std::array::from_fn(|i| u32::from_be_bytes(w[4 * i..4 * i + 4].try_into().unwrap()) as f32 * scale))
+        }
+        906 => {
+            // vctuxs: float -> unsigned int saturate, scaled by 2^UIMM (NaN and negatives -> 0)
+            let scale = (1u64 << (va & 31)) as f32;
+            let v = f4(b);
+            let mut o = [0u8; 16];
+            for i in 0..4 {
+                let r = if v[i].is_nan() { 0 } else { (v[i] * scale).trunc().clamp(0.0, u32::MAX as f32) as u32 };
+                o[4 * i..4 * i + 4].copy_from_slice(&r.to_be_bytes());
+            }
+            u128::from_be_bytes(o)
+        }
         970 => {
             // vctsxs: float -> signed int saturate, scaled by 2^UIMM
             let scale = (1u64 << (va & 31)) as f32;
@@ -336,6 +353,12 @@ impl Cpu {
             0x3D0 => vx_lanes(1100, a, b, 0).unwrap(), // vsro128
             0x300 => vx_lanes(14, a, b, 0).unwrap(),   // vpkuhum128
             0x380 => vx_lanes(78, a, b, 0).unwrap(),   // vpkuwum128
+            0x200 => crate::vmx_int::vx_int(398, a, b).unwrap(), // vpkshss128
+            0x240 => crate::vmx_int::vx_int(270, a, b).unwrap(), // vpkshus128
+            0x280 => crate::vmx_int::vx_int(462, a, b).unwrap(), // vpkswss128
+            0x2C0 => crate::vmx_int::vx_int(334, a, b).unwrap(), // vpkswus128
+            0x340 => crate::vmx_int::vx_int(142, a, b).unwrap(), // vpkuhus128
+            0x3C0 => crate::vmx_int::vx_int(206, a, b).unwrap(), // vpkuwus128
             _ => return false,
         };
         true
@@ -390,6 +413,16 @@ impl Cpu {
     /// high bits at inst[3:2]: vd = ((inst >> 21) & 31) | (inst & 0xC) << 3.
     #[inline(never)]
     pub(crate) fn exec_vmx128_mem<B: Bus>(&mut self, bus: &mut B, inst: u32) -> bool {
+        // vsldoi128 shares opcode 4 with the memory forms; it is the one with bit 4 set.
+        if inst & 0x10 != 0 {
+            let vd = (((inst >> 21) & 31) | ((inst & 0xC) << 3)) as usize;
+            let va = (((inst >> 16) & 31) | (inst & 0x20) | ((inst & 0x400) >> 4)) as usize;
+            let vb = (((inst >> 11) & 31) | ((inst & 3) << 5)) as usize;
+            let sh = ((inst >> 6) & 0xF) * 8;
+            let (a, b) = (self.vr[va], self.vr[vb]);
+            self.vr[vd] = if sh == 0 { a } else { (a << sh) | (b >> (128 - sh)) };
+            return true;
+        }
         // 128-form key -> equivalent standard X-form xo
         let std_xo = match inst & 0x7F3 {
             0x003 => 6,   // lvsl128
@@ -695,5 +728,36 @@ mod tests {
         c.step(&mut m).unwrap();
         assert_eq!(m.read8(0x80), 0x1F);
         assert_eq!(c.vr[6], c.vr[4]);
+    }
+
+    #[test]
+    fn vctuxs_and_vcfux() {
+        let mut c = Cpu::new();
+        let lanes = |a: f32, b: f32, c2: f32, d: f32| super::from_f4([a, b, c2, d]);
+        c.vr[1] = lanes(1.5, -3.0, 4294967296.0, f32::NAN);
+        // vctuxs v2,v1,0   (op 4, vD=2, vA=0, vB=1, xo 906)
+        assert!(c.exec_vmx(4 << 26 | 2 << 21 | 0 << 16 | 1 << 11 | 906));
+        let w = c.vr[2].to_be_bytes();
+        let word = |i: usize| u32::from_be_bytes(w[4 * i..4 * i + 4].try_into().unwrap());
+        assert_eq!([word(0), word(1), word(2), word(3)], [1, 0, u32::MAX, 0]);
+        // vcfux v3,v2,1 divides by 2
+        assert!(c.exec_vmx(4 << 26 | 3 << 21 | 1 << 16 | 2 << 11 | 778));
+        assert_eq!(super::f4(c.vr[3]), [0.5, 0.0, 2147483648.0, 0.0]);
+    }
+
+    #[test]
+    fn vsldoi128_shifts_the_concatenation() {
+        // the real crash instruction 0x119F5CB0 (vsldoi128, sh = 2 bytes, registers above 31)
+        let mut m = crate::memory::FlatMemory::new(16);
+        let mut c = Cpu::new();
+        let inst = 0x119F_5CB0u32;
+        m.write32(0, inst);
+        let vd = (((inst >> 21) & 31) | ((inst & 0xC) << 3)) as usize;
+        let va = (((inst >> 16) & 31) | (inst & 0x20) | ((inst & 0x400) >> 4)) as usize;
+        let vb = (((inst >> 11) & 31) | ((inst & 3) << 5)) as usize;
+        c.vr[va] = 0x0001_0203_0405_0607_0809_0A0B_0C0D_0E0F;
+        c.vr[vb] = 0x1011_1213_1415_1617_1819_1A1B_1C1D_1E1F;
+        c.step(&mut m).unwrap();
+        assert_eq!(c.vr[vd], 0x0203_0405_0607_0809_0A0B_0C0D_0E0F_1011);
     }
 }

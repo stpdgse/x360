@@ -124,6 +124,19 @@ dumps what r4/r6 point at, byte-store aware `X360_WATCH_MEM`, scheduler/kernel/G
 - Tooling: `X360_TRACE_CALLS=N,M` (instruction trace of the Nth visit to the `X360_WATCH` pc, main thread only),
   `cargo build --profile fast` for quick rebuilds.
 
+## Save states and the frame-9604 stall (latest)
+- **Save states**: `X360_SAVE_STATE=file,step` / `X360_LOAD_STATE=file` snapshot the whole machine (CPU, kernel, GPU,
+  memory; ~430 MB). Resuming takes 0.3 s, so experiments that used to replay 50 G instructions (8 min) now take seconds.
+  State files are `*.bin` (git-ignored).
+- Where the game stops: after swap #9604 (~50.15 G instrs) the render thread waits for the GPU fence forever while the
+  command processor loops over the same 18 one-primitive draw+resolve jobs (rotating destinations 0x1af27000 ...).
+- Findings: (1) the driver watchdog thread (thread 4, 30 ms timeout, check at 0x829d5338) fires against our slow virtual
+  GPU; `X360_WAIT_SCALE=100` stretches timeouts and buys ~50 more frames, but the loop returns, so it is not the root
+  cause. (2) CP interrupts only ran at the end of a time slice; `X360_IRQ_PREEMPT=1` runs them at once (10x CP speed) but
+  starves normal threads, so it is opt-in. (3) EVENT_WRITE_EXT extents and RB sample-count results are irrelevant here
+  (RB_SAMPLE_COUNT_ADDR is never set in the loop). EVENT_WRITE ZPD/VIZQUERY_END now writes a sample count when it is.
+- Tooling: `X360_TRACE_GPU_FROM/LEN` bound the packet trace, backtraces list unsignaled multi-wait objects.
+
 ## Honest gaps (not done)
 - XMA: the decoder isn't written (contexts/registers are plain storage). Will matter when the game plays XMA audio.
 - SEH/C++ exception unwinding (no .pdata walker). Thread-naming exception is handled.

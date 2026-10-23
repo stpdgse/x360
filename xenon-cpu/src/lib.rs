@@ -65,3 +65,69 @@ impl Default for Cpu {
         Self::new()
     }
 }
+
+/// A plain-data copy of a [`Cpu`] for save states (the register arrays are too big for serde's array impls).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CpuSnap {
+    trace: Vec<(u32, u32)>,
+    trace_pos: usize,
+    reservation: Option<u32>,
+    cycles: u64,
+    cpi: u64,
+    gpr: Vec<u64>,
+    fpr: Vec<u64>,
+    fpscr: u32,
+    vr: Vec<u128>,
+    cr: u32,
+    lr: u64,
+    ctr: u64,
+    xer: u64,
+    msr: u64,
+    pc: u64,
+}
+
+impl serde::Serialize for Cpu {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        CpuSnap {
+            trace: self.trace.to_vec(),
+            trace_pos: self.trace_pos,
+            reservation: self.reservation,
+            cycles: self.cycles,
+            cpi: self.cpi,
+            gpr: self.gpr.to_vec(),
+            fpr: self.fpr.to_vec(),
+            fpscr: self.fpscr,
+            vr: self.vr.to_vec(),
+            cr: self.cr,
+            lr: self.lr,
+            ctr: self.ctr,
+            xer: self.xer,
+            msr: self.msr,
+            pc: self.pc,
+        }
+        .serialize(s)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Cpu {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let n = CpuSnap::deserialize(d)?;
+        let mut c = Cpu::new();
+        c.trace.copy_from_slice(&n.trace);
+        c.trace_pos = n.trace_pos;
+        c.reservation = n.reservation;
+        c.cycles = n.cycles;
+        c.cpi = n.cpi;
+        c.gpr.copy_from_slice(&n.gpr);
+        c.fpr.copy_from_slice(&n.fpr);
+        c.fpscr = n.fpscr;
+        c.vr.copy_from_slice(&n.vr);
+        c.cr = n.cr;
+        c.lr = n.lr;
+        c.ctr = n.ctr;
+        c.xer = n.xer;
+        c.msr = n.msr;
+        c.pc = n.pc;
+        Ok(c)
+    }
+}

@@ -8,6 +8,7 @@
 //! `connect`/`disconnect` (the pad), `guide` (toggle the Guide overlay notification).
 //! Buttons: A B X Y UP DOWN LEFT RIGHT START BACK LB RB LS RS.
 
+use serde::{Deserialize, Serialize};
 use crate::kernel::Kernel;
 use crate::memory::GuestMemory;
 use std::collections::VecDeque;
@@ -20,6 +21,7 @@ pub const E_NO_SUCH_USER: u64 = 0x8007_0525;
 pub const ERROR_INSUFFICIENT_BUFFER: u64 = 0x7A;
 pub const ERROR_IO_PENDING: u64 = 0x3E5;
 pub const ERROR_NO_MORE_FILES: u64 = 0x12;
+pub const ERROR_NOT_FOUND: u64 = 0x490;
 pub const ERROR_INVALID_HANDLE: u64 = 0x6;
 
 // notification ids (area index in the top bits; see ObjectTable::broadcast)
@@ -74,7 +76,7 @@ fn button_vk(bit: u16) -> u16 {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PadAction {
     Press(u16),
     Release(u16),
@@ -86,7 +88,7 @@ pub enum PadAction {
     Guide,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Axis {
     Lx,
     Ly,
@@ -141,12 +143,13 @@ pub fn parse_script(text: &str) -> Result<Vec<(u64, PadAction)>, String> {
     Ok(out)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Keystroke {
     pub vk: u16,
     pub flags: u16,
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct XamState {
     pub signed_in: bool,
     pub pad_connected: bool,
@@ -158,7 +161,10 @@ pub struct XamState {
     pub vibration: (u16, u16),
     pub guide_open: bool,
     keystrokes: VecDeque<Keystroke>,
+    /// Per-enumerator private structures handed out by XamGetPrivateEnumStructureFromHandle.
+    pub enum_structs: std::collections::HashMap<u32, u32>,
     /// Keyboard state from the live window (OR-ed with the scripted state).
+    #[serde(skip)]
     pub live: Option<std::sync::Arc<crate::window::Shared>>,
     live_seen: (u16, [i16; 4], [u8; 2]),
     script: VecDeque<(u64, PadAction)>,
@@ -188,6 +194,7 @@ impl XamState {
             vibration: (0, 0),
             guide_open: false,
             keystrokes: VecDeque::new(),
+            enum_structs: Default::default(),
             live: None,
             live_seen: (0, [0; 4], [0; 2]),
             script: script.into(),
@@ -530,6 +537,64 @@ impl Kernel {
                 }
                 let h = self.objects.create(crate::objects::KObject::Enumerator { item_size: CONTENT_DATA_SIZE, items: Default::default() });
                 mem.write32(out, h);
+                cpu.gpr[3] = 0;
+            }
+            "XamCreateEnumeratorHandle" => {
+                // (user index, app id, open message, close message, extra size, item size, flags, HANDLE *out)
+                // Generic enumerator backed by a system app; with no apps behind it, it is simply empty.
+                let (item_size, out) = (cpu.gpr[8] as u32, cpu.gpr[10] as u32);
+                let h = self.objects.create(crate::objects::KObject::Enumerator { item_size, items: Default::default() });
+                if out != 0 {
+                    mem.write32(out, h);
+                }
+                cpu.gpr[3] = 0;
+            }
+            "XamGetPrivateEnumStructureFromHandle" => {
+                // (enumerator, void **out): the guest-visible structure behind an enumerator. Contents unknown;
+                // a zeroed block means "no entries, nothing pending".
+                let addr = match self.xam.enum_structs.get(&a) {
+                    Some(&p) => p,
+                    None => {
+                        let p = mem.alloc_kernel(0x100);
+                        self.xam.enum_structs.insert(a, p);
+                        p
+                    }
+                };
+                if b != 0 {
+                    mem.write32(b, addr);
+                }
+                cpu.gpr[3] = if self.objects.get(a).is_some() { 0 } else { ERROR_INVALID_HANDLE };
+            }
+            "XamAlloc" => {
+                // (flags, size, void **out): memory for XAM-owned structures, from the ordinary guest heap
+                match self.vm.allocate(mem, 0, b.max(1), crate::vm::MEM_RESERVE | crate::vm::MEM_COMMIT) {
+                    Ok((base, _)) => {
+                        mem.write32(c, base);
+                        cpu.gpr[3] = 0;
+                    }
+                    Err(_) => cpu.gpr[3] = 0x8007_000E, // E_OUTOFMEMORY
+                }
+            }
+            "XamFree" => {
+                // (void *ptr)
+                let _ = self.vm.free(mem, a, 0, crate::vm::MEM_RELEASE);
+                cpu.gpr[3] = 0;
+            }
+            "XamUserWriteProfileSettings" => {
+                // (title id, user index, setting count, settings*, overlapped*): accepted and dropped - there is no
+                // persistent profile store yet, so settings the title writes are not read back.
+                cpu.gpr[3] = if b == 0 && self.xam.signed_in { 0 } else { E_NO_SUCH_USER };
+            }
+            "XMsgStartIORequest" | "XMsgStartIORequestEx" => {
+                // (app id, message, overlapped*, buffer*, buffer size): a request to one of XAM's system apps
+                // (0xFA media player, 0xFB Live base, 0xFC XAM, ...). None of them exist here, so the honest answer
+                // is "not found"; a bare success would leave the title reading a reply that was never written.
+                if self.trace_calls {
+                    println!("note: {name} app={a:#x} message={b:#x} buffer={:#x} size={:#x} -> not found", cpu.gpr[6], cpu.gpr[7]);
+                }
+                cpu.gpr[3] = ERROR_NOT_FOUND;
+            }
+            "XMsgCancelIORequest" => {
                 cpu.gpr[3] = 0;
             }
             "XamEnumerate" => {

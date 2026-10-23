@@ -5,6 +5,7 @@
 //! Render targets are kept as plain f32 RGBA surfaces keyed by their EDRAM base. This ignores
 //! MSAA and the real EDRAM tile layout (a later refinement); it is enough to see images.
 
+use serde::{Deserialize, Serialize};
 use crate::gpu::{tiled_offset_2d, PHYS_VIEW};
 use crate::memory::GuestMemory;
 use crate::xenos_tex::TextureSampler;
@@ -31,7 +32,7 @@ const REG_COPY_CONTROL: usize = 0x2318;
 const REG_COLOR_CLEAR: usize = 0x231E;
 const REG_VERTEX_FETCH_CONSTS: usize = 0x4800;
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Surface {
     pub width: u32,
     pub height: u32,
@@ -44,7 +45,7 @@ impl Surface {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct Renderer {
     /// Colour render targets by EDRAM base (RB_COLOR_INFO[11:0]).
     pub surfaces: HashMap<u32, Surface>,

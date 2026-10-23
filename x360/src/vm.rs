@@ -3,6 +3,7 @@
 //! coalesces neighbours, so a long-running title that allocates and frees constantly never
 //! exhausts address space.
 
+use serde::{Deserialize, Serialize};
 use crate::memory::GuestMemory;
 use std::collections::BTreeMap;
 
@@ -31,7 +32,7 @@ fn round_up(v: u32, a: u32) -> u32 {
 }
 
 /// A first-fit range allocator over [start, end) with a coalescing free list.
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 struct RangeAlloc {
     /// Free ranges (start -> length).
     free: BTreeMap<u32, u32>,
@@ -102,6 +103,7 @@ impl RangeAlloc {
     }
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct Vm {
     phys: RangeAlloc,
     virt: RangeAlloc,

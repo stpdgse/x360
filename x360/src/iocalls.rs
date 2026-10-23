@@ -142,6 +142,7 @@ impl Kernel {
                                     if std::env::var_os("X360_TRACE_IO").is_some() {
                                         println!("[io] read {} off={at:#x} len={len:#x} -> {:#x} bytes into {buf:#010x}", entry.path, data.len());
                                     }
+                                    self.io_bytes += data.len() as u64;
                                     mem.write_bytes(buf, &data);
                                     if let Some((_, pos)) = self.objects.file_mut(h) {
                                         *pos = at + data.len() as u64;

@@ -7,6 +7,7 @@
 //! the result is written out at exit. Channel layout (interleaved FL FR FC LFE BL BR) is assumed
 //! from how the format is usually described; unverified until a title produces real sound.
 
+use serde::{Deserialize, Serialize};
 use crate::kernel::Kernel;
 use crate::memory::GuestMemory;
 use crate::sched::CPU_HZ;
@@ -20,7 +21,7 @@ pub const CHANNELS: u32 = 6;
 const MAX_STEREO_SAMPLES: usize = SAMPLE_RATE as usize * 120;
 pub const DRIVER_HANDLE: u32 = 0x4155_0001;
 
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct AudioState {
     pub client_fn: u32,
     pub client_ctx: u32,

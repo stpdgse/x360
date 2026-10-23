@@ -1,5 +1,6 @@
 //! Xbox 360 game disc (GDF / XISO) reader. Generic over any `Read + Seek`.
 
+use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Seek, SeekFrom};
 
 const SECTOR: u64 = 2048;
@@ -7,7 +8,7 @@ const MAGIC: &[u8; 20] = b"MICROSOFT*XBOX*MEDIA";
 /// Known game-partition start offsets: raw, XGD3, XGD2, XGD1.
 const PARTITION_OFFSETS: [u64; 4] = [0, 0x0208_0000, 0x0FD9_0000, 0x1830_0000];
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileEntry {
     pub path: String,
     pub sector: u32,

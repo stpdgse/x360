@@ -109,6 +109,7 @@ impl Cpu {
             0x6B0 => Some(from_f4(f4(b).map(f32::exp2))),        // vexptefp128
             0x6F0 => Some(from_f4(f4(b).map(f32::log2))),        // vlogefp128
             0x230 => vx_float(970, 0, b, imm5 as usize),         // vcfpsxws128 (float -> signed int)
+            0x270 => vx_float(906, 0, b, imm5 as usize),         // vcfpuxws128 (float -> unsigned int)
             0x2B0 => vx_float(842, 0, b, imm5 as usize),         // vcsxwfp128 (signed int -> float)
             0x2F0 => {
                 // vcuxwfp128: unsigned int -> float, scaled by 2^-imm
@@ -141,7 +142,8 @@ impl Cpu {
             }
         };
         let m = |t: bool| if t { !0u32 } else { 0 };
-        match inst & 0x3B0 {
+        // key bits: 4, 7, 8, 9 (bit 5 is part of the vA register number, bit 6 is Rc)
+        match inst & 0x390 {
             0x000 => cmp(self, zip32(a, b, |x, y| m(f32::from_bits(x) == f32::from_bits(y)))), // vcmpeqfp128
             0x080 => cmp(self, zip32(a, b, |x, y| m(f32::from_bits(x) >= f32::from_bits(y)))), // vcmpgefp128
             0x100 => cmp(self, zip32(a, b, |x, y| m(f32::from_bits(x) > f32::from_bits(y)))),  // vcmpgtfp128
@@ -225,5 +227,22 @@ mod tests {
         // rotated vB = [20,30,40,10]; mask 0101 -> lanes 1 and 3 replaced in vD ([1,2,3,4])
         assert_eq!(words(c.vr[2]), [1, 30, 3, 10]);
         assert_eq!(words(c.vr[6]), [40, 30, 20, 10]);
+    }
+
+    #[test]
+    fn vcmpeqfp128_with_high_a_register() {
+        // the real crash instruction 0x19BF6C20: vcmpeqfp128 whose vA register number has bit 5 set
+        let mut m = FlatMemory::new(16);
+        let mut c = Cpu::new();
+        m.write32(0, 0x19BF_6C20);
+        let inst = 0x19BF_6C20u32;
+        let vd = (((inst >> 21) & 31) | ((inst & 0xC) << 3)) as usize;
+        let va = (((inst >> 16) & 31) | (inst & 0x20) | ((inst & 0x400) >> 4)) as usize;
+        let vb = (((inst >> 11) & 31) | ((inst & 3) << 5)) as usize;
+        assert!(va >= 32);
+        c.vr[va] = from_words([1.0f32.to_bits(), 2.0f32.to_bits(), 3.0f32.to_bits(), 4.0f32.to_bits()]);
+        c.vr[vb] = from_words([1.0f32.to_bits(), 0.0f32.to_bits(), 3.0f32.to_bits(), 5.0f32.to_bits()]);
+        c.step(&mut m).unwrap();
+        assert_eq!(words(c.vr[vd]), [!0, 0, !0, 0]);
     }
 }

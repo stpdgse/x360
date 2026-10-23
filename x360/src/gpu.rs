@@ -5,6 +5,7 @@
 //! The CP runs synchronously: when the title writes CP_RB_WPTR, the run loop calls `process`,
 //! which consumes every pending packet and updates the read pointer.
 
+use serde::{Deserialize, Serialize};
 use crate::memory::GuestMemory;
 use crate::xenos_draw::Renderer;
 use crate::xenos_vm::ShaderKind;
@@ -201,7 +202,7 @@ pub fn write_bmp(path: &str, width: u32, height: u32, rgba: &[u8]) -> std::io::R
 }
 
 /// Front buffer description decoded from a texture fetch constant at swap time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FrontBuffer {
     pub base_phys: u32,
     pub width: u32,
@@ -212,7 +213,7 @@ pub struct FrontBuffer {
     pub tiled: bool,
 }
 
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct Gpu {
     pub renderer: Renderer,
     /// Number of XE_SWAP packets executed (frames presented).
@@ -220,7 +221,13 @@ pub struct Gpu {
     /// Is the display output switched on? Frames swapped while it is off are not shown.
     pub display_on: bool,
     pub no_render: bool,
+    sample_every: u64,
+    /// X360_SNAPSHOT="frame,draws,dir": from that frame on, render `draws` draws, then write every render
+    /// target to dir as PNG and stop rendering (shows what the title draws off-screen).
+    snapshot: Option<(u64, u64, String)>,
+    snapshot_draws: u64,
     /// Live preview window, if X360_WINDOW is set: presented frames are handed to it.
+    #[serde(skip)]
     pub window: Option<std::sync::Arc<crate::window::Shared>>,
     pub front_buffer: Option<FrontBuffer>,
     /// Physical address of the primary ring buffer.
@@ -234,8 +241,21 @@ pub struct Gpu {
     pub rptr_writeback_block: u32,
     /// Print every packet (X360_TRACE_GPU=1).
     pub trace: bool,
+    /// X360_TRACE_GPU_FROM=N / X360_TRACE_GPU_LEN=M: trace only packets N..N+M (counted from the start of the run).
+    #[serde(skip)]
+    pub trace_from: u64,
+    #[serde(skip)]
+    pub trace_len: u64,
+    #[serde(skip)]
+    zpd_logged: u32,
     /// Packets executed, by type-3 opcode, for the end-of-run summary.
     pub opcode_counts: HashMap<u32, u64>,
+    /// Histogram of (opcode, first body dword, body length) for EVENT_WRITE / EVENT_WRITE_EXT / EVENT_WRITE_ZPD.
+    pub event_kinds: HashMap<(u32, u32, usize), u64>,
+    /// EVENT_WRITE_EXT result addresses: first few, and the histogram of strides between consecutive ones.
+    pub ext_addrs: Vec<u32>,
+    pub ext_strides: HashMap<i64, u64>,
+    ext_last: u32,
     pub packets: u64,
     /// Draw calls seen (decoded and logged, not rasterized yet) and how many more to log.
     pub draws: u64,
@@ -273,14 +293,42 @@ impl Gpu {
         let copies = std::env::var("X360_LOG_COPIES").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
         Self {
             trace: std::env::var_os("X360_TRACE_GPU").is_some(),
+            trace_from: std::env::var("X360_TRACE_GPU_FROM").ok().and_then(|s| s.parse().ok()).unwrap_or(0),
+            trace_len: std::env::var("X360_TRACE_GPU_LEN").ok().and_then(|s| s.parse().ok()).unwrap_or(u64::MAX),
+            zpd_logged: 0,
             draw_log_budget: budget,
             copy_log_budget: copies,
             shader_log_budget: std::env::var("X360_LOG_SHADERS").ok().and_then(|s| s.parse().ok()).unwrap_or(0),
             display_on: true,
             no_render: std::env::var_os("X360_NO_RENDER").is_some(),
+            sample_every: std::env::var("X360_SAMPLE_DRAWS").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+            snapshot: std::env::var("X360_SNAPSHOT").ok().and_then(|v| {
+                let mut it = v.splitn(3, ',');
+                Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?, it.next()?.to_string()))
+            }),
+            snapshot_draws: 0,
             window: None,
             ..Default::default()
         }
+    }
+
+    fn tracing(&self) -> bool {
+        self.trace && self.packets >= self.trace_from && self.packets - self.trace_from < self.trace_len
+    }
+
+    /// After loading a save state: take the debug switches from this run's environment, not the saved run's.
+    pub fn reload_env(&mut self) {
+        let fresh = Gpu::new();
+        self.trace = fresh.trace;
+        self.trace_from = fresh.trace_from;
+        self.trace_len = fresh.trace_len;
+        self.no_render = fresh.no_render;
+        self.sample_every = fresh.sample_every;
+        self.snapshot = fresh.snapshot;
+        self.snapshot_draws = 0;
+        self.draw_log_budget = fresh.draw_log_budget;
+        self.copy_log_budget = fresh.copy_log_budget;
+        self.shader_log_budget = fresh.shader_log_budget;
     }
 
     pub fn ring_virtual(&self) -> u32 {
@@ -409,7 +457,7 @@ impl Gpu {
                 for (k, &v) in body.iter().enumerate() {
                     Self::write_reg(mem, if one_reg { base } else { base + k }, v);
                 }
-                if self.trace {
+                if self.tracing() {
                     let vals: Vec<String> = body.iter().take(4).map(|v| format!("{v:#x}")).collect();
                     println!("[gpu] type0 base={base:#x} count={} values={}", body.len(), vals.join(","));
                 }
@@ -425,9 +473,12 @@ impl Gpu {
                 let op = (hdr >> 8) & 0x7F;
                 if !self.stall_counted {
                     *self.opcode_counts.entry(op).or_insert(0) += 1;
-                    if self.trace || self.opcode_counts[&op] == 1 {
+                    if self.tracing() || self.opcode_counts[&op] == 1 {
                         println!("[gpu] type3 {:#04x} {} ({} dwords)", op, opcode_name(op), body.len());
                     }
+                }
+                if matches!(op, 0x46 | 0x47 | 0x5A) && !self.stall_counted {
+                    *self.event_kinds.entry((op, body.first().copied().unwrap_or(0), body.len())).or_insert(0) += 1;
                 }
                 self.exec_type3(mem, op, body, 0);
             }
@@ -608,6 +659,15 @@ impl Gpu {
                         tiled: w0 >> 31 != 0,
                     };
                     self.frames += 1;
+                    if let Some((f, _, _)) = &self.snapshot {
+                        if *f == self.frames {
+                            self.no_render = false;
+                        }
+                    }
+                    // X360_TRACE_GPU_AT_FRAME=N: start the packet trace once frame N has been presented
+                    if std::env::var("X360_TRACE_GPU_AT_FRAME").ok().and_then(|v| v.parse::<u64>().ok()) == Some(self.frames) {
+                        self.trace = true;
+                    }
                     println!(
                         "[gpu] SWAP #{}: front buffer phys {:#010x} {}x{} pitch {} fmt {} endian {} tiled {}",
                         self.frames, frame.base_phys, frame.width, frame.height, frame.pitch, frame.format, frame.endian, frame.tiled
@@ -641,6 +701,57 @@ impl Gpu {
                     }
                 }
             }
+            0x46 | 0x47 => {
+                // EVENT_WRITE / EVENT_WRITE_ZPD. A visibility-query end (VIZQUERY_END = 6) or z-pass done (0x16)
+                // makes the render backend store its sample counters at RB_SAMPLE_COUNT_ADDR (reg 0x2322): a
+                // begin/end pair of 64-bit counts. We count nothing, so report "plenty of samples passed".
+                let init = body.first().copied().unwrap_or(0) & 0x3F;
+                if op == 0x47 || init == 6 || init == 0x16 {
+                    let raw = mem.gpu_regs[0x2322];
+                    if self.zpd_logged < 4 || std::env::var_os("X360_LOG_ZPD").is_some() && self.zpd_logged < 40 {
+                        self.zpd_logged += 1;
+                        println!("[gpu] sample-count write op={op:#x} init={init:#x} RB_SAMPLE_COUNT_ADDR={raw:#x}");
+                    }
+                    let a = raw & 0x1FFF_FFF8;
+                    if a != 0 {
+                        let base = PHYS_VIEW | a;
+                        // begin (u64) = 0, end (u64) = 0x100, big-endian as the title reads it
+                        for (i, v) in [0u32, 0, 0, 0x100].iter().enumerate() {
+                            mem.write32(base + i as u32 * 4, *v);
+                        }
+                    }
+                }
+            }
+            0x5A => {
+                // EVENT_WRITE_EXT: [event initiator, address (low 2 bits = endian)]. The extended events report
+                // pipeline statistics - for the visibility/z-pass query (0x1A and friends) the GPU stores a begin/end
+                // pair of sample counters. We have no real counters, so report "plenty of samples passed": a title
+                // polling for the result then sees it complete, and visibility culling keeps everything visible.
+                if body.len() >= 2 {
+                    let a = body[1] & !3;
+                    if self.ext_addrs.len() < 12 {
+                        self.ext_addrs.push(a);
+                    }
+                    if self.ext_last != 0 {
+                        *self.ext_strides.entry(a as i64 - self.ext_last as i64).or_insert(0) += 1;
+                    }
+                    self.ext_last = a;
+                    let endian = body[1] & 3;
+                    let base = PHYS_VIEW | (body[1] & 0x1FFF_FFFC);
+                    // The titles' result records are 16 bytes apart with the result in the last 8 (GTA IV
+                    // reserves exactly two dwords), so write exactly two: begin = 0, end = 0x100 samples.
+                    let vals: [u32; 2] = std::env::var("X360_EXT")
+                        .ok()
+                        .and_then(|v| {
+                            let (a, b) = v.split_once(',')?;
+                            Some([u32::from_str_radix(a, 16).ok()?, u32::from_str_radix(b, 16).ok()?])
+                        })
+                        .unwrap_or([0, 0x100]);
+                    for (i, c) in vals.iter().enumerate() {
+                        mem.write32(base + i as u32 * 4, crate::xenos_draw::encode_endian(*c, endian));
+                    }
+                }
+            }
             0x58 => {
                 // EVENT_WRITE_SHD: [initiator, physical address (low bits = endian), value]
                 // The title polls this location as a fence; the CP "completes" instantly, so write now.
@@ -671,6 +782,17 @@ impl Gpu {
         let index32 = (initiator >> 11) & 1 != 0;
         self.draws += 1;
         let mode = mem.gpu_regs[REG_RB_MODECONTROL] & 7;
+        // X360_SAMPLE_DRAWS=N: print one line for every Nth draw (shader hashes, count, target) to tell a repeating
+        // loop from steady progress
+        if self.sample_every != 0 && self.draws % self.sample_every == 0 {
+            let h = |u: &Option<Vec<u32>>| u.as_ref().map(|v| v.iter().fold(0xcbf29ce484222325u64, |a, w| (a ^ *w as u64).wrapping_mul(0x100000001b3))).unwrap_or(0);
+            println!(
+                "[draw #{}] prim {} src {} count {} mode {} vs {:016x} ps {:016x} colorinfo {:#x} edram_base {:#x} scissor {:#x}/{:#x}",
+                self.draws, prim, src_sel, count, mode, h(&self.renderer.vs), h(&self.renderer.ps),
+                mem.gpu_regs[REG_RB_COLOR_INFO], mem.gpu_regs[REG_RB_COLOR_INFO] & 0xFFF,
+                mem.gpu_regs[0x2081], mem.gpu_regs[0x2082]
+            );
+        }
 
         // ---- gather the index list ----
         let indices: Vec<u32> = match src_sel {
@@ -708,7 +830,22 @@ impl Gpu {
         match mode {
             // X360_NO_RENDER=1 skips all pixel work (command stream still decoded): much faster
             // when only CPU / kernel progress matters. Frames come out black.
-            4 if !self.no_render => self.renderer.draw(mem, &regs, prim, &indices),
+            4 if !self.no_render => {
+                self.renderer.draw(mem, &regs, prim, &indices);
+                if let Some((_, n, dir)) = self.snapshot.clone() {
+                    self.snapshot_draws += 1;
+                    if self.snapshot_draws == n {
+                        let _ = std::fs::create_dir_all(&dir);
+                        for (key, surf) in &self.renderer.surfaces {
+                            let rgba: Vec<u8> = surf.px.iter().flat_map(|p| p.map(|c| (c.clamp(0.0, 1.0) * 255.0) as u8)).collect();
+                            let _ = write_png(&format!("{dir}/surface_{key:03x}.png"), surf.width, surf.height, &rgba);
+                        }
+                        println!("[gpu] snapshot: wrote {} render target(s) to {dir} after {n} draws", self.renderer.surfaces.len());
+                        self.no_render = true;
+                        self.snapshot = None;
+                    }
+                }
+            }
             5 if !self.no_render => self.renderer.resolve(mem, &regs),
             _ => {}
         }
@@ -741,8 +878,24 @@ impl Gpu {
         let mut ops: Vec<_> = self.opcode_counts.iter().collect();
         ops.sort();
         let list: Vec<String> = ops.iter().map(|(op, n)| format!("{}({:#x})x{}", opcode_name(**op), op, n)).collect();
+        let mut ev: Vec<_> = self.event_kinds.iter().collect();
+        ev.sort_by(|a, b| b.1.cmp(a.1));
+        let ev_list: Vec<String> = ev
+            .iter()
+            .take(8)
+            .map(|((op, init, len), n)| format!("{}(first dword {:#x}, {} dwords)x{}", opcode_name(*op), init, len, n))
+            .collect();
+        let mut st: Vec<_> = self.ext_strides.iter().collect();
+        st.sort_by(|a, b| b.1.cmp(a.1));
+        let st_list: Vec<String> = st.iter().take(8).map(|(d, n)| format!("{d:+#x}x{n}")).collect();
+        let addr_list: Vec<String> = self.ext_addrs.iter().map(|a| format!("{a:#x}")).collect();
         format!(
-            "gpu: {} packets; ring rptr={} pulled={} queued={} ib_depth={} stalled={}; type-3 opcodes: {}\n{}",
+            "gpu ext-event addresses: {} ; strides: {}
+gpu events: {}
+gpu: {} packets; ring rptr={} pulled={} queued={} ib_depth={} stalled={}; type-3 opcodes: {}\n{}",
+            addr_list.join(" "),
+            st_list.join(" "),
+            ev_list.join("; "),
             self.packets,
             self.rptr,
             self.pulled,

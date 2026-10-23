@@ -1,6 +1,7 @@
 //! Kernel HLE. Every import thunk lands in `dispatch`; anything not implemented
 //! returns an error naming the library and export, which is the crash-loop driver.
 
+use serde::{Deserialize, Serialize};
 use crate::export_table;
 use crate::dispatcher;
 use crate::fs::{Resolved, Vfs};
@@ -25,7 +26,7 @@ pub enum Next {
 }
 
 /// The executable's TLS template (XEX optional header 0x20104).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct TlsInfo {
     pub slot_count: u32,
     pub raw_data_addr: u32,
@@ -33,6 +34,7 @@ pub struct TlsInfo {
     pub raw_data_size: u32,
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct Kernel {
     /// Library names by import-library index, filled by the loader.
     pub libraries: Vec<String>,
@@ -48,6 +50,10 @@ pub struct Kernel {
     pub cp_interrupts: u64,
     /// Scheduler self-profile: pick_next calls and total host time spent in them.
     pub picks: u64,
+    /// Bytes read from the disc and host storage so far (for the status line).
+    pub io_bytes: u64,
+    /// Missing imports already reported under X360_STUB_MISSING.
+    pub stubbed: std::collections::HashSet<String>,
     /// Thread-list slots whose (recyclable) thread has exited, available for the next spawn.
     pub free_slots: Vec<usize>,
     pub syscall_cycles: u64,
@@ -60,6 +66,7 @@ pub struct Kernel {
     pub thread_names: HashMap<u32, String>,
     pub gpu: Gpu,
     /// The mounted game disc, if we were started from an image.
+    #[serde(skip)]
     pub vfs: Option<Vfs>,
     pub threads: Vec<ThreadCtx>,
     /// Index into `threads` of the thread currently executing.
@@ -103,6 +110,8 @@ impl Kernel {
             vsyncs: 0,
             cp_interrupts: 0,
             picks: 0,
+            io_bytes: 0,
+            stubbed: Default::default(),
             free_slots: Vec::new(),
             syscall_cycles: std::env::var("X360_SYSCALL_CYCLES").ok().and_then(|v| v.parse().ok()).unwrap_or(1500),
             pick_time: std::time::Duration::ZERO,
@@ -757,6 +766,18 @@ impl Kernel {
             }
             _ => {
                 if self.host_io_call(name, cpu, mem)? || self.io_call(name, cpu, mem)? {
+                    return Ok(());
+                }
+                // X360_STUB_MISSING=1: log each missing import once and answer "success" (0) so a single run
+                // can reveal many of them; the run may go wrong later because of it - implement them for real.
+                if std::env::var_os("X360_STUB_MISSING").is_some() {
+                    if self.stubbed.insert(name.to_string()) {
+                        println!(
+                            "[stub] {lib_name}!{name} (ordinal {ordinal:#06x}) args r3={:#x} r4={:#x} r5={:#x} r6={:#x} r7={:#x} r8={:#x} lr={:#x}",
+                            cpu.gpr[3], cpu.gpr[4], cpu.gpr[5], cpu.gpr[6], cpu.gpr[7], cpu.gpr[8], cpu.lr
+                        );
+                    }
+                    cpu.gpr[3] = 0;
                     return Ok(());
                 }
                 Err(format!(

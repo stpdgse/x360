@@ -1,6 +1,7 @@
 //! Guest thread scheduler: thread contexts, creation, blocking waits, round-robin picking
 //! on a virtual clock (executed instructions; 1 NT tick of 100ns ~= 320 cycles at 3.2GHz).
 
+use serde::{Deserialize, Serialize};
 use crate::dispatcher::{self, Acquire};
 use crate::kernel::{Kernel, Next, TlsInfo};
 use crate::memory::GuestMemory;
@@ -19,7 +20,7 @@ pub const CPU_HZ: f64 = 3_200_000_000.0;
 pub const INTERNAL_LIB: u32 = 0x7FFF;
 pub const INTERNAL_THREAD_EXIT: u32 = 1;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Wait {
     None,
     /// Wait on a non-dispatcher handle (e.g. a thread).
@@ -35,7 +36,7 @@ pub enum Wait {
 }
 
 /// One object in a multi-wait: a dispatcher header in guest memory, or a handle to a non-dispatcher object.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WaitTarget {
     Object(u32),
     Handle(u32),
@@ -48,6 +49,28 @@ fn target_signaled(objects: &crate::objects::ObjectTable, mem: &GuestMemory, t: 
             Some(addr) => dispatcher::peek_signaled(mem, addr),
             None => objects.peek_wait(h),
         },
+    }
+}
+
+impl Kernel {
+    /// Debug: one line per unsignaled target of a multi-wait (X360_BACKTRACES).
+    pub fn describe_wait(&self, mem: &GuestMemory, idx: usize) -> String {
+        match &self.threads[idx].wait {
+            Wait::Multi { targets, all, .. } => {
+                let mut s = format!("multi-wait all={all} n={}:", targets.len());
+                for (i, &t) in targets.iter().enumerate() {
+                    if !target_signaled(&self.objects, mem, t) {
+                        let a = match t {
+                            WaitTarget::Object(a) => a,
+                            WaitTarget::Handle(h) => self.objects.dispatcher_addr(h).unwrap_or(0),
+                        };
+                        s += &format!(" [{i}] {t:?} unsignaled hdr={:08x}", if a != 0 { mem.read32(a) } else { 0 });
+                    }
+                }
+                s
+            }
+            w => format!("{w:?}"),
+        }
     }
 }
 
@@ -88,6 +111,7 @@ fn try_multi(
     timed_out.then_some(STATUS_TIMEOUT)
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct ThreadCtx {
     pub cpu: Cpu,
     pub id: u32,
@@ -107,6 +131,8 @@ pub struct ThreadCtx {
     /// Kernel-spawned helper nobody holds a handle to (audio/interrupt callbacks): its resources and
     /// its slot are reused when it exits, so the endless stream of them can't exhaust memory.
     pub recyclable: bool,
+    /// Instructions this thread has executed (for the status line's CPU-share report).
+    pub executed: u64,
     /// Resources to free on exit: stack (base, size), TLS block, and the object sizes.
     pub stack: (u32, u32),
     pub tls_block: u32,
@@ -201,6 +227,7 @@ impl Kernel {
             is_shutdown: false,
             is_audio: false,
             recyclable: false,
+            executed: 0,
             stack: (sbase, ssize),
             tls_block,
             irql: 0,
@@ -573,7 +600,11 @@ impl Kernel {
             return None;
         }
         let v = mem.read64(ptr) as i64;
-        Some(if v < 0 { now + (-v) as u64 * CYCLES_PER_TICK } else { now + v as u64 * CYCLES_PER_TICK })
+        // X360_WAIT_SCALE=N stretches every relative wait timeout (debug: is a driver watchdog firing because
+        // our virtual GPU is slow?).
+        static SCALE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let scale = *SCALE.get_or_init(|| std::env::var("X360_WAIT_SCALE").ok().and_then(|s| s.parse().ok()).unwrap_or(1));
+        Some(if v < 0 { now + (-v) as u64 * CYCLES_PER_TICK * scale } else { now + v as u64 * CYCLES_PER_TICK })
     }
 
     fn thread_exit(&mut self, mem: &mut GuestMemory, code: u32) -> Next {

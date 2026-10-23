@@ -1,6 +1,7 @@
 //! Kernel object manager: the handle table. Events and semaphores are *not* stored here —
 //! their state lives in guest memory (`dispatcher.rs`) and a handle just points at it.
 
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 
 pub const STATUS_SUCCESS: u32 = 0;
@@ -8,7 +9,7 @@ pub const STATUS_TIMEOUT: u32 = 0x0000_0102;
 pub const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
 pub const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum KObject {
     /// An event/semaphore/... whose dispatcher header is at guest address `addr`.
     Dispatcher { addr: u32 },
@@ -32,6 +33,7 @@ pub enum WaitResult {
     InvalidHandle,
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct ObjectTable {
     next: u32,
     objects: HashMap<u32, KObject>,

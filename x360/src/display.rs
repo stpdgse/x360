@@ -6,11 +6,13 @@
 //! register values are recorded (see `last_*`) rather than guessed at, and only the fields we
 //! are confident of (on/off, refresh, persisted buffer) drive behaviour.
 
+use serde::{Deserialize, Serialize};
 use crate::kernel::Kernel;
 use crate::memory::GuestMemory;
 use xenon_cpu::memory::Bus;
 use xenon_cpu::Cpu;
 
+#[derive(Serialize, Deserialize)]
 pub struct DisplayState {
     pub width: u32,
     pub height: u32,

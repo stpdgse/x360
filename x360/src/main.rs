@@ -17,6 +17,7 @@ mod loader;
 mod memory;
 mod objects;
 mod sched;
+mod snapshot;
 mod vm;
 mod window;
 mod xam;
@@ -222,6 +223,39 @@ fn main() {
     let mut slice = 0u32;
     let mut steps = 0u64;
     let mut switches = 0u64;
+    // X360_LOAD_STATE=file: resume a saved machine instead of the fresh boot above (the max-instructions argument
+    // then means "this many more"). X360_SAVE_STATE=file,steps: write one when the run reaches `steps`.
+    let mut max_steps = max_steps;
+    if let Ok(file) = std::env::var("X360_LOAD_STATE") {
+        let t0 = std::time::Instant::now();
+        match snapshot::load(&file, &mut mem) {
+            Ok((k2, saved_steps)) => {
+                let vfs = kernel.vfs.take();
+                kernel = k2;
+                kernel.vfs = vfs;
+                kernel.trace_calls = std::env::var_os("X360_TRACE_KERNEL").is_some();
+                kernel.syscall_cycles = std::env::var("X360_SYSCALL_CYCLES").ok().and_then(|v| v.parse().ok()).unwrap_or(1500);
+                kernel.gpu.reload_env();
+                if let Some(l) = &live {
+                    kernel.gpu.window = Some(l.clone());
+                    kernel.xam.live = Some(l.clone());
+                }
+                cur = kernel.cur;
+                cpu = kernel.take_cpu(cur);
+                steps = saved_steps;
+                max_steps = saved_steps + max_steps;
+                println!("loaded state {file} ({:.1}G instructions in) in {:.1}s", saved_steps as f64 / 1e9, t0.elapsed().as_secs_f64());
+            }
+            Err(e) => {
+                eprintln!("could not load state {file}: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    let mut save_request: Option<(String, u64)> = std::env::var("X360_SAVE_STATE").ok().and_then(|v| {
+        let (f, n) = v.rsplit_once(',')?;
+        Some((f.to_string(), n.trim().parse().ok()?))
+    });
 
     // X360_WATCH="0x827e2078,0x827e2098" prints registers each time any thread reaches one of these PCs.
     let watch: Vec<u64> = std::env::var("X360_WATCH")
@@ -229,14 +263,24 @@ fn main() {
         .unwrap_or_default();
     // JIT: translate hot blocks to native code (X360_NOJIT=1 forces the interpreter, needed for exact
     // fault pcs and for the per-pc watch tools).
+    // X360_COUNT_PCS="0xPC,0xPC": count visits to those addresses (no logging, cheap even for hot functions)
+    let count_pcs: Vec<u64> = std::env::var("X360_COUNT_PCS")
+        .ok()
+        .map(|s| s.split(',').filter_map(|a| u64::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()).collect())
+        .unwrap_or_default();
+    let mut pc_counts: Vec<u64> = vec![0; count_pcs.len()];
     let mut jit = (std::env::var_os("X360_NOJIT").is_none() && !std::env::var_os("X360_OPSTATS").is_some())
         .then(|| xenon_cpu::jit::Jit::<GuestMemory>::new_mode(module.base, module.base + module.size, true));
     if let Some(j) = jit.as_mut() {
         for &w in &watch {
             j.add_break(w as u32);
         }
+        for &w in &count_pcs {
+            j.add_break(w as u32);
+        }
     }
     let mut at_entry = true;
+    let mut next_cp_poll: u64 = 0;
     // X360_TRACE_CALLS="N,M": for the Nth and Mth visits to the (first) X360_WATCH pc, write an instruction
     // trace of the next 30000 instructions to trace_<N>.txt (runs those instructions in the interpreter).
     let trace_calls: Vec<u32> = std::env::var("X360_TRACE_CALLS")
@@ -261,8 +305,43 @@ fn main() {
     // X360_OPSTATS=1: histogram of executed instruction kinds, printed at exit (drives JIT priorities)
     let opstats = std::env::var_os("X360_OPSTATS").is_some();
     let mut op_hist: std::collections::HashMap<(u32, u32), u64> = std::collections::HashMap::new();
+    // X360_STATUS_EVERY=<instructions>: print a progress line at that interval (is the game moving or looping?)
+    let status_every: u64 = std::env::var("X360_STATUS_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let mut next_status = status_every;
     while steps < max_steps {
         let pc_before = cpu.pc;
+        if save_request.as_ref().is_some_and(|(_, at)| steps >= *at) {
+            let (file, _) = save_request.take().unwrap();
+            let t0 = std::time::Instant::now();
+            kernel.put_cpu(cur, cpu);
+            match snapshot::save(&file, &kernel, &mem, steps) {
+                Ok(()) => println!("saved state {file} at {:.1}G instructions in {:.1}s", steps as f64 / 1e9, t0.elapsed().as_secs_f64()),
+                Err(e) => eprintln!("could not save state {file}: {e}"),
+            }
+            cpu = kernel.take_cpu(cur);
+        }
+        if status_every != 0 && steps >= next_status {
+            next_status = steps - steps % status_every + status_every;
+            let live = kernel.threads.iter().filter(|t| !t.terminated).count();
+            // CPU share of the busiest threads since the last status line (id[kind]: share of instructions)
+            let total: u64 = kernel.threads.iter().map(|t| t.executed).sum::<u64>().max(1);
+            let mut top: Vec<(u32, u64, &str)> = kernel
+                .threads
+                .iter()
+                .filter(|t| t.executed > 0)
+                .map(|t| (t.id, t.executed, if t.is_interrupt { "irq" } else if t.is_audio { "audio" } else { "" }))
+                .collect();
+            top.sort_by(|a, b| b.1.cmp(&a.1));
+            let _ = total;
+            let share: Vec<String> = top.iter().take(6).map(|(id, n, k)| format!("t{id}{k}:{:.1}G", *n as f64 / 1e9)).collect();
+            println!("[status] busiest threads (cumulative instrs): {}", share.join(" "));
+            println!(
+                "[status] {:.1}G instrs | vsync {} frames {} | gpu packets {} draws {} | kernel calls {} | io {:.1} MB | live threads {} | virtual {:.0}s",
+                steps as f64 / 1e9, kernel.vsyncs, kernel.gpu.frames, kernel.gpu.packets,
+                kernel.gpu.opcode_counts.get(&0x36).copied().unwrap_or(0) + kernel.gpu.opcode_counts.get(&0x22).copied().unwrap_or(0),
+                kernel_calls, kernel.io_bytes as f64 / 1e6, live, kernel.global_cycles as f64 / 3.2e9
+            );
+        }
         if opstats {
             let inst = mem.read32(cpu.pc as u32);
             let opcd = inst >> 26;
@@ -277,7 +356,7 @@ fn main() {
             };
             *op_hist.entry((opcd, sub)).or_default() += 1;
         }
-        if steps == trace_after {
+        if steps >= trace_after && !kernel.trace_calls {
             kernel.trace_calls = true;
         }
         if trace_left > 0 && kernel.threads[cur].id == 1 {
@@ -289,6 +368,11 @@ fn main() {
             trace_left -= 1;
             if trace_left == 0 {
                 trace_out = None;
+            }
+        }
+        if !count_pcs.is_empty() {
+            if let Some(i) = count_pcs.iter().position(|&p| p == cpu.pc) {
+                pc_counts[i] += 1;
             }
         }
         if !watch.is_empty() && watch.contains(&cpu.pc) {
@@ -334,11 +418,13 @@ fn main() {
         let r = match jit.as_mut() {
             Some(j) if at_entry && trace_left == 0 => match j.run(&mut cpu, &mut mem) {
                 xenon_cpu::jit::Outcome::Ran(n) => {
+                    kernel.threads[cur].executed += n;
                     steps += n;
                     slice += n as u32;
                     Ok(())
                 }
                 xenon_cpu::jit::Outcome::Trapped(n, t) => {
+                    kernel.threads[cur].executed += n;
                     steps += n;
                     slice += n as u32;
                     at_entry = true;
@@ -346,6 +432,7 @@ fn main() {
                 }
                 xenon_cpu::jit::Outcome::Interpret => {
                     let r = cpu.step(&mut mem);
+                    kernel.threads[cur].executed += 1;
                     steps += 1;
                     slice += 1;
                     at_entry = cpu.pc != pc_before.wrapping_add(4);
@@ -374,6 +461,16 @@ fn main() {
                     cpu.lr
                 ));
             }
+            if mem.watch_read.swap(0, std::sync::atomic::Ordering::Relaxed) != 0 {
+                mem_watch_hits += 1;
+                while mem_watch_log.len() >= 40 {
+                    mem_watch_log.pop_front();
+                }
+                mem_watch_log.push_back(format!(
+                    "[watchREAD #{mem_watch_hits} t{tid}] {:#010x} = {:#010x} read by block at pc={pc_before:#010x} (lr={:#010x}) at step {steps}",
+                    mem.watch_addr, mem.read32_unwatched(mem.watch_addr), cpu.lr
+                ));
+            }
             if mem.gpu_dirty.swap(false, std::sync::atomic::Ordering::Relaxed) {
                 let t0 = std::time::Instant::now();
                 kernel.gpu.process(&mut mem);
@@ -385,7 +482,18 @@ fn main() {
                 break;
             }
         }
+        // A command processor blocked on WAIT_REG_MEM is released by the CPU writing memory, and the CPU may be
+        // spinning waiting for the CP in turn. Looking only at scheduling points made every such hand-off cost a
+        // whole time slice; polling every few hundred instructions keeps the pair in step.
+        if kernel.gpu.stalled && steps >= next_cp_poll {
+            next_cp_poll = steps + 400;
+            kernel.gpu.process(&mut mem);
+        }
+        let mut irq_preempt = false;
         if !kernel.gpu.pending_interrupts.is_empty() {
+            // A real CP interrupt pre-empts whatever is running at once; waiting for the slice to end
+            // made every CP hand-off cost a whole slice of the other threads spinning.
+            irq_preempt = std::env::var_os("X360_IRQ_PREEMPT").is_some();
             if let Err(e) = kernel.deliver_gpu_interrupts(&mut mem) {
                 crash_report(&cpu, &mem, tid, &e);
                 break;
@@ -452,6 +560,9 @@ fn main() {
             println!("terminate notifications finished: title exited cleanly (code {:#x})", exit_code.unwrap());
             break;
         }
+        if irq_preempt && kernel.threads[cur].irql < 2 {
+            reschedule = true;
+        }
         if reschedule {
             if live.as_ref().is_some_and(|l| l.closed.load(std::sync::atomic::Ordering::Relaxed)) {
                 println!("
@@ -507,6 +618,9 @@ window closed: stopping");
     if let Some(j) = &jit {
         println!("{}", j.summary());
     }
+    for (p, n) in count_pcs.iter().zip(&pc_counts) {
+        println!("[count] pc {p:#x} visited {n} times");
+    }
     println!("scheduler: {} picks, {:.2}s in pick_next", kernel.picks, kernel.pick_time.as_secs_f64());
     println!("vsync interrupts fired: {}, CP interrupts: {}", kernel.vsyncs, kernel.cp_interrupts);
     println!("threads at exit:\n{}", kernel.thread_summary(Some((cur, cpu.pc))));
@@ -517,6 +631,9 @@ window closed: stopping");
                 continue;
             }
             let c = if i == cur { &cpu } else { &t.cpu };
+            if matches!(t.wait, sched::Wait::Multi { .. }) {
+                eprintln!("  thread {} {}", t.id, kernel.describe_wait(&mem, i));
+            }
             let mut chain = format!("pc={:#x} lr={:#x}", c.pc, c.lr);
             let mut sp = c.gpr[1] as u32;
             for _ in 0..14 {

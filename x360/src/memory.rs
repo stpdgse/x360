@@ -34,6 +34,8 @@ pub struct GuestMemory {
     /// Debug: guest address whose 32-bit writes are reported (0 = off), and the last such write.
     pub watch_addr: u32,
     pub watch_hit: Option<(u32, u32)>,
+    /// Set (with attn) when the watched address is read; the value is the last word read there.
+    pub watch_read: AtomicU64,
 }
 
 /// XMA audio decoder register block (little-endian device registers, read via lwbrx/stwbrx).
@@ -59,6 +61,7 @@ impl GuestMemory {
             xma_regs: vec![0; XMA_REG_COUNT],
             watch_addr: 0,
             watch_hit: None,
+            watch_read: AtomicU64::new(0),
             gpu_dirty: AtomicBool::new(false),
             attn: AtomicBool::new(false),
         }
@@ -118,8 +121,73 @@ impl GuestMemory {
         }
     }
 
+    /// Write every mapped page (zero pages as a flag only) plus the kernel allocator state and device registers.
+    pub fn save_to(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
+        let hdr = bincode::serialize(&(self.kernel_next, &self.kernel_free, &self.gpu_regs, &self.xma_regs))
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        w.write_all(&(hdr.len() as u64).to_le_bytes())?;
+        w.write_all(&hdr)?;
+        let mapped: Vec<u32> = (0..PAGES as u32).filter(|&i| self.pages[i as usize].is_some()).collect();
+        w.write_all(&(mapped.len() as u64).to_le_bytes())?;
+        for i in mapped {
+            let page = self.pages[i as usize].as_ref().unwrap();
+            let zero = page.iter().all(|&b| b == 0);
+            w.write_all(&i.to_le_bytes())?;
+            w.write_all(&[zero as u8])?;
+            if !zero {
+                w.write_all(&page[..])?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Replace this memory's contents with a [`save_to`] stream.
+    pub fn load_from(&mut self, r: &mut impl std::io::Read) -> std::io::Result<()> {
+        let mut n8 = [0u8; 8];
+        r.read_exact(&mut n8)?;
+        let mut hdr = vec![0u8; u64::from_le_bytes(n8) as usize];
+        r.read_exact(&mut hdr)?;
+        let (kernel_next, kernel_free, gpu_regs, xma_regs): (u32, std::collections::HashMap<u32, Vec<u32>>, Vec<u32>, Vec<u32>) =
+            bincode::deserialize(&hdr).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        self.kernel_next = kernel_next;
+        self.kernel_free = kernel_free;
+        self.gpu_regs = gpu_regs;
+        self.xma_regs = xma_regs;
+        for p in self.pages.iter_mut() {
+            *p = None;
+        }
+        r.read_exact(&mut n8)?;
+        let count = u64::from_le_bytes(n8);
+        let mut idx = [0u8; 4];
+        let mut flag = [0u8; 1];
+        for _ in 0..count {
+            r.read_exact(&mut idx)?;
+            r.read_exact(&mut flag)?;
+            let mut page = Box::new([0u8; PAGE]);
+            if flag[0] == 0 {
+                r.read_exact(&mut page[..])?;
+            }
+            self.pages[u32::from_le_bytes(idx) as usize] = Some(page);
+        }
+        Ok(())
+    }
+
+    /// A read of `addr` that doesn't trip the read watch (for the watch's own report).
+    pub fn read32_unwatched(&self, addr: u32) -> u32 {
+        match &self.pages[addr as usize / PAGE] {
+            Some(p) => {
+                let off = addr as usize % PAGE;
+                u32::from_be_bytes([p[off], p[off + 1], p[off + 2], p[off + 3]])
+            }
+            None => match physical_alias(addr) {
+                Some(a) => self.read32_unwatched(a),
+                None => 0,
+            },
+        }
+    }
+
     pub fn is_mapped(&self, addr: u32) -> bool {
-        self.pages[addr as usize / PAGE].is_some()
+        self.pages[addr as usize / PAGE].is_some() || physical_alias(addr).is_some_and(|a| self.pages[a as usize / PAGE].is_some())
     }
 
     /// Bulk copy into already-mapped memory (loader use; no fault tracking).
@@ -140,6 +208,13 @@ impl GuestMemory {
     }
 }
 
+/// The console maps its physical memory several times: this emulator stores it at 0xA0000000 | phys, while
+/// titles also use the 0xC0000000 and 0xE0000000 views of the same bytes. Unmapped accesses up there are
+/// redirected to the 0xA0000000 view.
+fn physical_alias(addr: u32) -> Option<u32> {
+    if addr >= 0xC000_0000 { Some(0xA000_0000 | (addr & 0x1FFF_FFFF)) } else { None }
+}
+
 impl Bus for GuestMemory {
     fn page_table(&self) -> Option<*const *mut u8> {
         // Vec<Option<Box<[u8; PAGE]>>>: a thin nullable pointer per page, allocated once and never resized
@@ -147,12 +222,19 @@ impl Bus for GuestMemory {
         if self.watch_addr != 0 { None } else { Some(self.pages.as_ptr() as *const *mut u8) }
     }
     fn read8(&self, addr: u32) -> u8 {
+        if addr & !3 == self.watch_addr && self.watch_addr != 0 {
+            self.watch_read.store(1 << 63 | 8, Relaxed);
+            self.attn.store(true, Relaxed);
+        }
         match &self.pages[addr as usize / PAGE] {
             Some(p) => p[addr as usize % PAGE],
-            None => {
-                self.note(addr, false);
-                0
-            }
+            None => match physical_alias(addr) {
+                Some(a) => self.read8(a),
+                None => {
+                    self.note(addr, false);
+                    0
+                }
+            },
         }
     }
     fn write8(&mut self, addr: u32, val: u8) {
@@ -162,7 +244,10 @@ impl Bus for GuestMemory {
         }
         match &mut self.pages[addr as usize / PAGE] {
             Some(p) => p[addr as usize % PAGE] = val,
-            None => self.note(addr, true),
+            None => match physical_alias(addr) {
+                Some(a) => self.write8(a, val),
+                None => self.note(addr, true),
+            },
         }
     }
 
@@ -213,6 +298,10 @@ impl Bus for GuestMemory {
     }
 
     fn read32(&self, addr: u32) -> u32 {
+        if addr == self.watch_addr && self.watch_addr != 0 {
+            self.watch_read.store(1 << 63 | 32, Relaxed);
+            self.attn.store(true, Relaxed);
+        }
         let off = addr as usize % PAGE;
         if off <= PAGE - 4 {
             if let Some(p) = &self.pages[addr as usize / PAGE] {
@@ -316,5 +405,22 @@ mod tests {
             c.step(&mut m).unwrap();
         }
         println!("{:.1} M instructions/sec (memory mix)", n as f64 / t.elapsed().as_secs_f64() / 1e6);
+    }
+
+    #[test]
+    fn physical_memory_is_visible_through_every_view() {
+        let mut m = GuestMemory::new();
+        m.map(0xA000_0000 + 0x0198_9000, 0x2000);
+        m.write32(0xA198_9010, 0xCAFEBABE);
+        assert_eq!(m.read32(0xC198_9010), 0xCAFEBABE, "0xC0000000 view");
+        assert_eq!(m.read32(0xE198_9010), 0xCAFEBABE, "0xE0000000 view");
+        m.write16(0xC198_9020, 0x1234);
+        assert_eq!(m.read16(0xA198_9020), 0x1234);
+        m.write64(0xE198_9030, 0x0102_0304_0506_0708);
+        assert_eq!(m.read64(0xA198_9030), 0x0102_0304_0506_0708);
+        assert!(m.is_mapped(0xC198_9000));
+        assert!(m.take_fault().is_none());
+        assert_eq!(m.read32(0xC7FF_0000), 0); // nothing there: still a fault
+        assert!(m.take_fault().is_some());
     }
 }
