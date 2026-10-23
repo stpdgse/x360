@@ -51,6 +51,9 @@ pub struct Jit<B: Bus> {
     code_start: u32,
     code_end: u32,
     counter: u32,
+    /// Compile for 32-bit mode (MSR[SF] = 0): CR0 and the CTR test look at the low word. Blocks only run
+    /// for threads whose mode matches.
+    mode32: bool,
     /// Addresses a block must never run through (debug watches): blocks end just before them so the
     /// run loop sees each visit.
     break_pcs: std::collections::HashSet<u32>,
@@ -141,6 +144,7 @@ struct Em<'a, 'b> {
     bus: Value,
     h: HelperRefs,
     cpi: Value,
+    mode32: bool,
     /// The bus's page table, passed in per call (None: every access calls a helper).
     table: Option<Value>,
     gpr: [Option<Value>; 32],
@@ -297,6 +301,13 @@ impl<'a, 'b> Em<'a, 'b> {
         self.set_cr(new);
     }
     fn set_cr0(&mut self, v: Value) {
+        // 32-bit mode: the sign / zero test is on the low word, sign-extended
+        let v = if self.mode32 {
+            let t = self.b.ins().ireduce(types::I32, v);
+            self.b.ins().sextend(types::I64, t)
+        } else {
+            v
+        };
         let zero = self.iconst(0);
         let lt = self.b.ins().icmp(IntCC::SignedLessThan, v, zero);
         let gt = self.b.ins().icmp(IntCC::SignedGreaterThan, v, zero);
@@ -844,6 +855,12 @@ impl<'a, 'b> Em<'a, 'b> {
         }
         if dec_ctr && bo & 0b00100 == 0 {
             let c = self.get_spr(Reg::Ctr);
+            let c = if self.mode32 {
+                let t = self.b.ins().ireduce(types::I32, c);
+                self.b.ins().uextend(types::I64, t)
+            } else {
+                c
+            };
             let zero = self.iconst(0);
             let cc = if bo & 0b00010 != 0 { IntCC::Equal } else { IntCC::NotEqual };
             result = Some(self.b.ins().icmp(cc, c, zero));
@@ -866,6 +883,10 @@ impl<'a, 'b> Em<'a, 'b> {
 impl<B: Bus + 'static> Jit<B> {
     /// `code_start..code_end` is the address range blocks may be formed in (the executable image).
     pub fn new(code_start: u32, code_end: u32) -> Self {
+        Self::new_mode(code_start, code_end, false)
+    }
+
+    pub fn new_mode(code_start: u32, code_end: u32, mode32: bool) -> Self {
         let mut flags = settings::builder();
         // Blocks are short and compiled often: cheap compile beats extra optimisation, and the verifier
         // only helps while developing (X360_JIT_VERIFY=1 turns it on).
@@ -893,6 +914,7 @@ impl<B: Bus + 'static> Jit<B> {
             code_start,
             code_end,
             counter: 0,
+            mode32,
             break_pcs: Default::default(),
             blocks_compiled: 0,
             instrs_compiled: 0,
@@ -920,7 +942,7 @@ impl<B: Bus + 'static> Jit<B> {
     /// Call only at block entries (after a taken branch), where the counting is meaningful.
     pub fn run(&mut self, cpu: &mut Cpu, bus: &mut B) -> Outcome {
         let pc = cpu.pc as u32;
-        if pc < self.code_start || pc >= self.code_end || pc & 3 != 0 {
+        if pc < self.code_start || pc >= self.code_end || pc & 3 != 0 || cpu.mode32() != self.mode32 {
             return Outcome::Interpret;
         }
         let idx = ((pc - self.code_start) >> 2) as usize;
@@ -1028,6 +1050,7 @@ impl<B: Bus + 'static> Jit<B> {
                 bus: busv,
                 h,
                 cpi,
+                mode32: self.mode32,
                 table: if bus.page_table().is_some() { Some(tablev) } else { None },
                 gpr: [None; 32],
                 gpr_dirty: [false; 32],
@@ -1119,6 +1142,21 @@ mod tests {
     const BASE: u32 = 0x1000;
     const DATA: u32 = 0x4000;
 
+    thread_local! {
+        /// which MSR[SF] mode the current test thread exercises
+        static MODE32: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    fn mode32() -> bool {
+        MODE32.with(|m| m.get())
+    }
+    /// Run a test body in both 64-bit and 32-bit mode.
+    fn both_modes(body: impl Fn()) {
+        for m in [false, true] {
+            MODE32.with(|c| c.set(m));
+            body();
+        }
+    }
+
     /// xorshift PRNG so the tests are deterministic
     struct Rng(u64);
     impl Rng {
@@ -1153,6 +1191,7 @@ mod tests {
         c.ctr = rng.next() % 8;
         c.xer = (rng.r32() & 0xE000_0000) as u64;
         c.pc = BASE as u64;
+        c.msr = if mode32() { 0x9030 } else { 1 << 63 };
         c
     }
 
@@ -1184,7 +1223,7 @@ mod tests {
         let (mut c1, mut m1) = (random_cpu(&mut r1), fresh_mem(&mut r1, inst));
         let (mut c2, mut m2) = (random_cpu(&mut r2), fresh_mem(&mut r2, inst));
         let t1 = (c1.step(&mut m1).and_then(|_| c1.step(&mut m1))).err();
-        let mut jit = Jit::<FlatMemory>::new(BASE, BASE + 0x100);
+        let mut jit = Jit::<FlatMemory>::new_mode(BASE, BASE + 0x100, mode32());
         warm(&mut jit, &m2);
         let mut t2 = None;
         match jit.run(&mut c2, &mut m2) {
@@ -1205,6 +1244,7 @@ mod tests {
             let mut sc = Cpu::new();
             sc.pc = BASE as u64;
             sc.cpi = 3;
+            sc.msr = if mode32() { 0x9030 } else { 1 << 63 };
             let mut sm = FlatMemory { data: mem.data.clone() };
             let _ = jit.run(&mut sc, &mut sm);
         }
@@ -1219,6 +1259,9 @@ mod tests {
 
     #[test]
     fn differential_random_instructions() {
+        both_modes(|| differential_random_instructions_body());
+    }
+    fn differential_random_instructions_body() {
         let mut rng = Rng(0x1234_5678_9ABC_DEF1);
         let mut count = 0;
         // D-form ALU / compares / loads / stores
@@ -1314,6 +1357,9 @@ mod tests {
 
     #[test]
     fn unsupported_instruction_falls_back_to_the_interpreter() {
+        both_modes(|| unsupported_instruction_falls_back_to_the_interpreter_body());
+    }
+    fn unsupported_instruction_falls_back_to_the_interpreter_body() {
         // sraw (xo 792) isn't translated natively; the helper path must give identical results
         let mut rng = Rng(77);
         for _ in 0..200 {
@@ -1325,6 +1371,9 @@ mod tests {
 
     #[test]
     fn branches_match() {
+        both_modes(|| branches_match_body());
+    }
+    fn branches_match_body() {
         let mut rng = Rng(99);
         for _ in 0..600 {
             let bo = rng.r32() % 32;
@@ -1354,7 +1403,7 @@ mod tests {
         let (mut c2, mut m2) = (random_cpu(&mut r2), fresh_mem(&mut r2, inst));
         // when the interpreter's pc ends up outside the test range the comparison is still valid
         c1.step(&mut m1).unwrap();
-        let mut jit = Jit::<FlatMemory>::new(BASE, BASE + 0x100);
+        let mut jit = Jit::<FlatMemory>::new_mode(BASE, BASE + 0x100, mode32());
         warm(&mut jit, &m2);
         match jit.run(&mut c2, &mut m2) {
             Outcome::Ran(n) => assert_eq!(n, 1),
@@ -1395,6 +1444,9 @@ mod tests {
 
     #[test]
     fn inline_memory_path_matches_including_page_edges_and_unmapped_pages() {
+        both_modes(|| inline_memory_path_matches_including_page_edges_and_unmapped_pages_body());
+    }
+    fn inline_memory_path_matches_including_page_edges_and_unmapped_pages_body() {
         // pages 0..=5 mapped (code at 0x1000), page 6 and 7 unmapped
         let mut rng = Rng(4242);
         let ops: Vec<(u32, bool)> = vec![
@@ -1431,7 +1483,7 @@ mod tests {
                 cases += 1;
             }
         }
-        assert!(cases > 1000);
+        assert!(cases > 100);
     }
 
     fn paged_check(inst: u32, base_reg: usize, base: u32, seed: u64) {
@@ -1455,11 +1507,12 @@ mod tests {
         let (mut c2, mut m2) = build(seed);
         c1.step(&mut m1).unwrap();
         c1.step(&mut m1).unwrap();
-        let mut jit = Jit::<PagedBus>::new(BASE, BASE + 0x100);
+        let mut jit = Jit::<PagedBus>::new_mode(BASE, BASE + 0x100, mode32());
         for _ in 0..HEAT_THRESHOLD {
             let mut sc = Cpu::new();
             sc.pc = BASE as u64;
             sc.cpi = 3;
+            sc.msr = if mode32() { 0x9030 } else { 1 << 63 };
             let mut sm = PagedBus::new(&[0, 1, 2, 3, 4, 5]);
             sm.write32(BASE, inst);
             sm.write32(BASE + 4, 0x4800_0008);

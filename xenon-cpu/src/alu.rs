@@ -14,11 +14,19 @@ fn mask64(mb: u32, me: u32) -> u64 {
     if mb <= me { a & b } else { a | b }
 }
 
-fn add3(a: u64, b: u64, cin: u64) -> (u64, bool, bool) {
+/// a + b + cin with the carry/overflow of the current mode: 64-bit, or - in 32-bit mode (MSR[SF] = 0, which is
+/// how all Xbox 360 user code runs) - of the low word. The 64-bit sum itself is the same either way.
+fn add3(a: u64, b: u64, cin: u64, mode32: bool) -> (u64, bool, bool) {
     let (s1, c1) = a.overflowing_add(b);
     let (s2, c2) = s1.overflowing_add(cin);
-    let ov = ((a ^ s2) & (b ^ s2)) >> 63 != 0;
-    (s2, c1 || c2, ov)
+    if mode32 {
+        let wide = (a as u32 as u64) + (b as u32 as u64) + cin;
+        let ov = ((a ^ s2) & (b ^ s2)) >> 31 & 1 != 0;
+        (s2, wide >> 32 != 0, ov)
+    } else {
+        let ov = ((a ^ s2) & (b ^ s2)) >> 63 != 0;
+        (s2, c1 || c2, ov)
+    }
 }
 
 impl Cpu {
@@ -41,12 +49,12 @@ impl Cpu {
         match opcd {
             7 => self.gpr[rd] = (self.gpr[ra] as i64).wrapping_mul(simm as i64) as u64,
             8 => {
-                let (r, c, _) = add3(!self.gpr[ra], simm, 1);
+                let (r, c, _) = add3(!self.gpr[ra], simm, 1, self.mode32());
                 self.gpr[rd] = r;
                 self.set_ca(c);
             }
             12 | 13 => {
-                let (r, c, _) = add3(self.gpr[ra], simm, 0);
+                let (r, c, _) = add3(self.gpr[ra], simm, 0, self.mode32());
                 self.gpr[rd] = r;
                 self.set_ca(c);
                 if opcd == 13 {
@@ -148,17 +156,17 @@ impl Cpu {
             }
         };
         match xo & 0x1FF {
-            266 => { let (r, _, o) = add3(a, b, 0); arith(self, r, None, o); return true; }
-            10 => { let (r, c, o) = add3(a, b, 0); arith(self, r, Some(c), o); return true; }
-            138 => { let (r, c, o) = add3(a, b, self.ca()); arith(self, r, Some(c), o); return true; }
-            202 => { let (r, c, o) = add3(a, 0, self.ca()); arith(self, r, Some(c), o); return true; }
-            234 => { let (r, c, o) = add3(a, !0, self.ca()); arith(self, r, Some(c), o); return true; }
-            40 => { let (r, _, o) = add3(!a, b, 1); arith(self, r, None, o); return true; }
-            8 => { let (r, c, o) = add3(!a, b, 1); arith(self, r, Some(c), o); return true; }
-            136 => { let (r, c, o) = add3(!a, b, self.ca()); arith(self, r, Some(c), o); return true; }
-            200 => { let (r, c, o) = add3(!a, 0, self.ca()); arith(self, r, Some(c), o); return true; }
-            232 => { let (r, c, o) = add3(!a, !0, self.ca()); arith(self, r, Some(c), o); return true; }
-            104 => { let (r, _, o) = add3(!a, 0, 1); arith(self, r, None, o); return true; }
+            266 => { let (r, _, o) = add3(a, b, 0, self.mode32()); arith(self, r, None, o); return true; }
+            10 => { let (r, c, o) = add3(a, b, 0, self.mode32()); arith(self, r, Some(c), o); return true; }
+            138 => { let (r, c, o) = add3(a, b, self.ca(), self.mode32()); arith(self, r, Some(c), o); return true; }
+            202 => { let (r, c, o) = add3(a, 0, self.ca(), self.mode32()); arith(self, r, Some(c), o); return true; }
+            234 => { let (r, c, o) = add3(a, !0, self.ca(), self.mode32()); arith(self, r, Some(c), o); return true; }
+            40 => { let (r, _, o) = add3(!a, b, 1, self.mode32()); arith(self, r, None, o); return true; }
+            8 => { let (r, c, o) = add3(!a, b, 1, self.mode32()); arith(self, r, Some(c), o); return true; }
+            136 => { let (r, c, o) = add3(!a, b, self.ca(), self.mode32()); arith(self, r, Some(c), o); return true; }
+            200 => { let (r, c, o) = add3(!a, 0, self.ca(), self.mode32()); arith(self, r, Some(c), o); return true; }
+            232 => { let (r, c, o) = add3(!a, !0, self.ca(), self.mode32()); arith(self, r, Some(c), o); return true; }
+            104 => { let (r, _, o) = add3(!a, 0, 1, self.mode32()); arith(self, r, None, o); return true; }
             235 => {
                 let p = (a as i32 as i64).wrapping_mul(b as i32 as i64);
                 arith(self, p as u64, None, p != p as i32 as i64);

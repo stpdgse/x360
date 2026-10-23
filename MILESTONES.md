@@ -109,6 +109,21 @@ virtual time, ~550 frames. Fixes that got it there, all found by crash-looping o
 Debug additions: `X360_BACKTRACES=1` (every live thread's call chain at exit), `X360_WATCH` keeps the *last* hits and
 dumps what r4/r6 point at, byte-store aware `X360_WATCH_MEM`, scheduler/kernel/GPU self-profile lines.
 
+## JIT and the 32-bit-mode fix
+- `xenon-cpu/src/jit.rs`: block JIT (Cranelift). Natively translates the hot integer / load-store / branch
+  instructions (~86% of what GTA IV executes) with inline guest-memory access; everything else runs through the
+  interpreter (`Cpu::exec`) from inside the block. Differential tests compare it against the interpreter on random
+  instructions in both CPU modes, including page edges and unmapped pages. ~33 -> ~120-170 M instr/s.
+  `X360_NOJIT=1` = interpreter only (exact fault pcs). The memory/PC watches work with the JIT.
+- **Xbox 360 user code runs in 32-bit mode (MSR[SF]=0)**: CR0, carries/overflow and the CTR test look at the low
+  word. The C runtime's `--cnt < 0` on a zero-extended int depends on it; with 64-bit semantics `sscanf` ran
+  off the end of its buffer and smashed the main thread's stack (crash after ~36 G instructions on the loading
+  screen). Fixed in interpreter and JIT, with a regression test.
+- Other fixes this stretch: audio/interrupt helper threads recycle their resources (the kernel heap used to run
+  into the game image after ~6500 threads), `VdSwap` pending-state struct, scaler command buffer size.
+- Tooling: `X360_TRACE_CALLS=N,M` (instruction trace of the Nth visit to the `X360_WATCH` pc, main thread only),
+  `cargo build --profile fast` for quick rebuilds.
+
 ## Honest gaps (not done)
 - XMA: the decoder isn't written (contexts/registers are plain storage). Will matter when the game plays XMA audio.
 - SEH/C++ exception unwinding (no .pdata walker). Thread-naming exception is handled.

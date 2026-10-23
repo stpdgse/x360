@@ -147,8 +147,14 @@ impl Cpu {
         self.cr = (self.cr & !(0xF << shift)) | (v << shift);
     }
 
+    /// MSR[SF] clear = 32-bit mode: condition codes, carries and the CTR test look only at the low word.
+    /// (Xbox 360 user threads run this way; the C runtime relies on it, e.g. `--cnt < 0` on a zero-extended int.)
+    pub(crate) fn mode32(&self) -> bool {
+        self.msr >> 63 == 0
+    }
+
     pub(crate) fn set_cr0(&mut self, val: u64) {
-        let v = val as i64;
+        let v = if self.mode32() { val as u32 as i32 as i64 } else { val as i64 };
         self.set_cr_field(0, v < 0, v > 0, v == 0);
     }
 
@@ -164,7 +170,8 @@ impl Cpu {
         if bo & 0b00100 == 0 {
             self.ctr = self.ctr.wrapping_sub(1);
         }
-        let ctr_ok = bo & 0b00100 != 0 || ((self.ctr != 0) ^ (bo & 0b00010 != 0));
+        let ctr_val = if self.mode32() { self.ctr as u32 as u64 } else { self.ctr };
+        let ctr_ok = bo & 0b00100 != 0 || ((ctr_val != 0) ^ (bo & 0b00010 != 0));
         let cond_ok = bo & 0b10000 != 0 || (self.cr_bit(bi) == (bo & 0b01000 != 0));
         ctr_ok && cond_ok
     }
@@ -574,5 +581,28 @@ mod tests {
         assert_eq!(c.recent_pcs(5), vec![0x24, 0x28, 0x10, 0x14, 0x18]);
         assert_eq!(c.recent_pcs(3), vec![0x10, 0x14, 0x18]);
         assert_eq!(c.recent_pcs(8), vec![0, 4, 0x20, 0x24, 0x28, 0x10, 0x14, 0x18]);
+    }
+
+    #[test]
+    fn thirty_two_bit_mode_judges_record_forms_on_the_low_word() {
+        // the C runtime's `--cnt < 0` on a zero-extended int: 0x00000000_FFFFFFFF - 1 must read as negative
+        let mut m = FlatMemory::new(0x100);
+        m.write32(0, 0x356B_FFFF); // addic. r11,r11,-1
+        for mode32 in [true, false] {
+            let mut c = Cpu::new();
+            c.msr = if mode32 { 0x9030 } else { 1 << 63 };
+            c.gpr[11] = 0x0000_0000_FFFF_FFFF;
+            c.pc = 0;
+            c.step(&mut m).unwrap();
+            let lt = c.cr >> 31 & 1;
+            assert_eq!(lt == 1, mode32, "LT in {} mode", if mode32 { "32-bit" } else { "64-bit" });
+            assert_eq!(c.gpr[11], 0x0000_0000_FFFF_FFFE);
+            assert_eq!(c.xer >> 29 & 1, 1, "carry out of the low word (and the full 64-bit add) is set");
+        }
+        // a count register of 0x1_0000_0000 is zero as far as bdnz is concerned in 32-bit mode
+        let mut c = Cpu::new();
+        c.msr = 0x9030;
+        c.ctr = 0x1_0000_0001;
+        assert!(!c.do_branch_cond(0b10000, 0), "bdnz: ctr-1 has a zero low word, so the loop ends");
     }
 }

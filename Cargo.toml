@@ -7,3 +7,12 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 debug = 1
+
+# Quick-iteration profile: same code optimisation, but no whole-program LTO and parallel codegen,
+# so rebuilds after a small edit take seconds instead of minutes.  Use: cargo build --profile fast
+[profile.fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
+debug = false

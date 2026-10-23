@@ -53,7 +53,7 @@ impl Cpu {
             lr: 0,
             ctr: 0,
             xer: 0,
-            msr: 0,
+            msr: 1 << 63, // 64-bit mode by default; the kernel starts guest threads with 0x9030 (32-bit)
             pc: 0,
             pending_trap: None,
         }

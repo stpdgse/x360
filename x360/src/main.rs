@@ -230,7 +230,7 @@ fn main() {
     // JIT: translate hot blocks to native code (X360_NOJIT=1 forces the interpreter, needed for exact
     // fault pcs and for the per-pc watch tools).
     let mut jit = (std::env::var_os("X360_NOJIT").is_none() && !std::env::var_os("X360_OPSTATS").is_some())
-        .then(|| xenon_cpu::jit::Jit::<GuestMemory>::new(module.base, module.base + module.size));
+        .then(|| xenon_cpu::jit::Jit::<GuestMemory>::new_mode(module.base, module.base + module.size, true));
     if let Some(j) = jit.as_mut() {
         for &w in &watch {
             j.add_break(w as u32);
@@ -280,11 +280,11 @@ fn main() {
         if steps == trace_after {
             kernel.trace_calls = true;
         }
-        if trace_left > 0 {
+        if trace_left > 0 && kernel.threads[cur].id == 1 {
             use std::io::Write;
             if let Some(w) = trace_out.as_mut() {
                 let inst = mem.read32(cpu.pc as u32);
-                let _ = writeln!(w, "{:08x}: {:08x}  {}   r3={:x} r4={:x} r23={:x} r30={:x}", cpu.pc, inst, disasm::disasm(cpu.pc as u32, inst), cpu.gpr[3], cpu.gpr[4], cpu.gpr[23], cpu.gpr[30]);
+                let _ = writeln!(w, "{:08x}: {:08x}  {}   r3={:x} r4={:x} r23={:x} r30={:x} FILE[ptr={:x} cnt={:x}]", cpu.pc, inst, disasm::disasm(cpu.pc as u32, inst), cpu.gpr[3], cpu.gpr[4], cpu.gpr[23], cpu.gpr[30], mem.read32(0x4003f720), mem.read32(0x4003f724));
             }
             trace_left -= 1;
             if trace_left == 0 {
@@ -293,7 +293,7 @@ fn main() {
         }
         if !watch.is_empty() && watch.contains(&cpu.pc) {
             if let Some(&n) = trace_calls.iter().find(|&&n| n == watch_hits + 1) {
-                trace_left = 30000;
+                trace_left = 60000;
                 trace_out = std::fs::File::create(format!("trace_{n}.txt")).ok().map(std::io::BufWriter::new);
                 at_entry = false;
             }
