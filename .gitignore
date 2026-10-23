@@ -27,3 +27,4 @@ trace_*.txt
 .idea/
 Thumbs.db
 desktop.ini
+/snap*/
