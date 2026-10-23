@@ -287,6 +287,8 @@ fn main() {
         .map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect())
         .unwrap_or_default();
     let mut trace_left: u32 = 0;
+    // X360_TRACE_TID=<id>: which thread X360_TRACE_CALLS records (default: the main thread, 1)
+    let trace_tid: u32 = std::env::var("X360_TRACE_TID").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
     let mut trace_out: Option<std::io::BufWriter<std::fs::File>> = None;
     let mut watch_hits = 0u32;
     let mut watch_log: std::collections::VecDeque<String> = std::collections::VecDeque::new();
@@ -359,7 +361,7 @@ fn main() {
         if steps >= trace_after && !kernel.trace_calls {
             kernel.trace_calls = true;
         }
-        if trace_left > 0 && kernel.threads[cur].id == 1 {
+        if trace_left > 0 && kernel.threads[cur].id == trace_tid {
             use std::io::Write;
             if let Some(w) = trace_out.as_mut() {
                 let inst = mem.read32(cpu.pc as u32);
@@ -473,7 +475,7 @@ fn main() {
             }
             if mem.gpu_dirty.swap(false, std::sync::atomic::Ordering::Relaxed) {
                 let t0 = std::time::Instant::now();
-                kernel.gpu.process(&mut mem);
+                run_gpu(&mut kernel, &mut mem);
                 gpu_time += t0.elapsed();
             }
             if let Some(f) = mem.take_fault() {
@@ -487,7 +489,7 @@ fn main() {
         // whole time slice; polling every few hundred instructions keeps the pair in step.
         if kernel.gpu.stalled && steps >= next_cp_poll {
             next_cp_poll = steps + 400;
-            kernel.gpu.process(&mut mem);
+            run_gpu(&mut kernel, &mut mem);
         }
         let mut irq_preempt = false;
         if !kernel.gpu.pending_interrupts.is_empty() {
@@ -572,7 +574,7 @@ window closed: stopping");
             // A CP blocked on WAIT_REG_MEM can only be released by the CPU writing memory, so
             // re-check it at every scheduling point.
             if kernel.gpu.stalled {
-                kernel.gpu.process(&mut mem);
+                run_gpu(&mut kernel, &mut mem);
             }
             kernel.put_cpu(cur, cpu);
             match kernel.pick_next(&mut mem) {
@@ -652,4 +654,17 @@ window closed: stopping");
     kernel.audio.finish();
     println!("{}", kernel.gpu.summary());
     let _ = mem.read8(0); // keep Bus import used
+}
+
+/// Run the command processor, unless it is held back until the interrupt handler its last INTERRUPT packet raised
+/// has finished (the handler reads and acknowledges state the CP would otherwise run past).
+fn run_gpu(kernel: &mut kernel::Kernel, mem: &mut memory::GuestMemory) {
+    if kernel.gpu.hold {
+        if kernel.threads.iter().any(|t| t.is_interrupt && !t.terminated) {
+            kernel.gpu.stalled = true; // keep polling
+            return;
+        }
+        kernel.gpu.hold = false;
+    }
+    kernel.gpu.process(mem);
 }

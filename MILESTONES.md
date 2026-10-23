@@ -135,6 +135,16 @@ dumps what r4/r6 point at, byte-store aware `X360_WATCH_MEM`, scheduler/kernel/G
   cause. (2) CP interrupts only ran at the end of a time slice; `X360_IRQ_PREEMPT=1` runs them at once (10x CP speed) but
   starves normal threads, so it is opt-in. (3) EVENT_WRITE_EXT extents and RB sample-count results are irrelevant here
   (RB_SAMPLE_COUNT_ADDR is never set in the loop). EVENT_WRITE ZPD/VIZQUERY_END now writes a sample count when it is.
+- Narrowing (later): the post-9604 ring traffic is written by **thread 4** (the driver's deferred-command/tiling worker),
+  not the render thread. Each CP INTERRUPT runs the ISR, which calls the driver callback `0x829ddd30` to enqueue work item
+  `0xd7664d80` for thread 4; thread 4 walks the item's records (extent/visibility rectangles, then IB calls
+  `0x175db800`/`0x175d6160`, 29 and 5538 dwords) and submits them again, mostly sitting in the ring-space wait. The same
+  item is re-enqueued forever. Ruled out: JIT miscompile (identical under `X360_NOJIT=1`), ISR/CP ordering race
+  (`X360_NO_IRQ_HOLD` vs default hold), query/extent values, watchdog timeouts, ring wrap/replay (only 134k ring dwords
+  vs 14M IB-packet executions: the ring is fine, the IBs are what repeat). Open question: why the tile/query state
+  machine in thread 4 (struct at 0x400ae5c0, work queue at 0x400ae7d4) never reaches its end record.
+- Tooling: `X360_TRACE_TID=<id>` picks the thread for `X360_TRACE_CALLS`, `X360_LOG_IB=1` logs IB calls and the ring base,
+  GPU summary counts ring vs IB packets, `X360_NO_IRQ_HOLD=1` disables the CP-waits-for-ISR ordering.
 - Tooling: `X360_TRACE_GPU_FROM/LEN` bound the packet trace, backtraces list unsignaled multi-wait objects.
 
 ## Honest gaps (not done)

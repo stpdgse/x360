@@ -248,6 +248,22 @@ pub struct Gpu {
     pub trace_len: u64,
     #[serde(skip)]
     zpd_logged: u32,
+    /// Debug counters: ring dwords pulled from guest memory, packets run from the ring, packets run from IBs.
+    #[serde(skip)]
+    ib_logged: u32,
+    /// Set by an INTERRUPT packet: stop pulling packets until the interrupt handler thread has finished.
+    #[serde(skip)]
+    pub hold: bool,
+    #[serde(skip)]
+    yield_after: bool,
+    #[serde(skip)]
+    no_irq_hold: bool,
+    #[serde(skip)]
+    pub dbg_ring_dwords: u64,
+    #[serde(skip)]
+    pub dbg_ring_packets: u64,
+    #[serde(skip)]
+    pub dbg_ib_packets: u64,
     /// Packets executed, by type-3 opcode, for the end-of-run summary.
     pub opcode_counts: HashMap<u32, u64>,
     /// Histogram of (opcode, first body dword, body length) for EVENT_WRITE / EVENT_WRITE_EXT / EVENT_WRITE_ZPD.
@@ -296,6 +312,13 @@ impl Gpu {
             trace_from: std::env::var("X360_TRACE_GPU_FROM").ok().and_then(|s| s.parse().ok()).unwrap_or(0),
             trace_len: std::env::var("X360_TRACE_GPU_LEN").ok().and_then(|s| s.parse().ok()).unwrap_or(u64::MAX),
             zpd_logged: 0,
+            ib_logged: 0,
+            hold: false,
+            yield_after: false,
+            no_irq_hold: std::env::var_os("X360_NO_IRQ_HOLD").is_some(),
+            dbg_ring_dwords: 0,
+            dbg_ring_packets: 0,
+            dbg_ib_packets: 0,
             draw_log_budget: budget,
             copy_log_budget: copies,
             shader_log_budget: std::env::var("X360_LOG_SHADERS").ok().and_then(|s| s.parse().ok()).unwrap_or(0),
@@ -322,6 +345,7 @@ impl Gpu {
         self.trace = fresh.trace;
         self.trace_from = fresh.trace_from;
         self.trace_len = fresh.trace_len;
+        self.no_irq_hold = fresh.no_irq_hold;
         self.no_render = fresh.no_render;
         self.sample_every = fresh.sample_every;
         self.snapshot = fresh.snapshot;
@@ -366,14 +390,23 @@ impl Gpu {
         let mask = self.ring_size_bytes() / 4 - 1;
         let wptr = mem.gpu_regs[REG_CP_RB_WPTR] & mask;
         let base = self.ring_virtual();
+        if self.pulled != wptr && self.dbg_ring_dwords == 0 && std::env::var_os("X360_LOG_IB").is_some() {
+            println!("[gpu] ring at {base:#x}, {} dwords, wptr {wptr}", mask + 1);
+        }
         while self.pulled != wptr {
+            self.dbg_ring_dwords += 1;
             self.queue.push_back(mem.read32(base + self.pulled * 4));
             self.pulled = (self.pulled + 1) & mask;
         }
         let mut stalled = false;
         loop {
             match self.step(mem, mask) {
-                Step::Progress => {}
+                Step::Progress => {
+                    if std::mem::take(&mut self.yield_after) {
+                        stalled = true;
+                        break;
+                    }
+                }
                 Step::Idle => break,
                 Step::Stalled => {
                     stalled = true;
@@ -415,6 +448,11 @@ impl Gpu {
         self.exec_packet(mem, hdr, &body);
         if self.stall_request {
             return Step::Stalled;
+        }
+        if from_ring {
+            self.dbg_ring_packets += 1;
+        } else {
+            self.dbg_ib_packets += 1;
         }
         if from_ring {
             self.queue.drain(..total);
@@ -599,6 +637,10 @@ impl Gpu {
                 // as a new frame so a stall inside it resumes exactly where it stopped.
                 if body.len() >= 2 {
                     let (addr, size) = (PHYS_VIEW | body[0], body[1] & 0xF_FFFF);
+                    if self.packets >= self.trace_from && self.ib_logged < 60 && std::env::var_os("X360_LOG_IB").is_some() {
+                        self.ib_logged += 1;
+                        println!("[gpu] IB addr={:#x} size={} (body {:#x},{:#x}) depth={}", body[0], size, body[0], body[1], self.ib_stack.len());
+                    }
                     self.pending_ib = Some((0..size).map(|k| mem.read32(addr + k * 4)).collect());
                 }
             }
@@ -640,6 +682,12 @@ impl Gpu {
                 // INTERRUPT: [cpu mask]. Raises a CP interrupt, delivered to the title's graphics
                 // callback on the CPU core(s) selected by the mask.
                 self.pending_interrupts.push(body.first().copied().unwrap_or(1));
+                // The ISR reads state the stream is about to overwrite (scratch registers) and releases the
+                // waits that follow, so the CP must not run on until it has run.
+                if !self.no_irq_hold {
+                    self.yield_after = true;
+                    self.hold = true;
+                }
             }
             0x60 => self.bin_mask = (self.bin_mask & !0xFFFF_FFFF) | body.first().copied().unwrap_or(0) as u64,
             0x61 => self.bin_mask = (self.bin_mask & 0xFFFF_FFFF) | (body.first().copied().unwrap_or(0) as u64) << 32,
@@ -892,11 +940,14 @@ impl Gpu {
         format!(
             "gpu ext-event addresses: {} ; strides: {}
 gpu events: {}
-gpu: {} packets; ring rptr={} pulled={} queued={} ib_depth={} stalled={}; type-3 opcodes: {}\n{}",
+gpu: {} packets ({} from ring, {} from IBs, {} ring dwords pulled); ring rptr={} pulled={} queued={} ib_depth={} stalled={}; type-3 opcodes: {}\n{}",
             addr_list.join(" "),
             st_list.join(" "),
             ev_list.join("; "),
             self.packets,
+            self.dbg_ring_packets,
+            self.dbg_ib_packets,
+            self.dbg_ring_dwords,
             self.rptr,
             self.pulled,
             self.queue.len(),
