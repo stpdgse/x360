@@ -287,6 +287,8 @@ fn main() {
         .map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect())
         .unwrap_or_default();
     let mut trace_left: u32 = 0;
+    // X360_WATCH_LIVE=1: print a line the moment each X360_WATCH pc is reached (to interleave with other live logs)
+    let watch_live = std::env::var_os("X360_WATCH_LIVE").is_some();
     // X360_WATCH_KEEP=<n>: how many X360_WATCH hits to keep (the most recent n), default 60
     let watch_keep: usize = std::env::var("X360_WATCH_KEEP").ok().and_then(|v| v.parse().ok()).unwrap_or(60);
     // X360_CP_DELAY=<instructions>: how long freshly written ring commands take to reach the command processor
@@ -387,6 +389,9 @@ fn main() {
                 trace_left = std::env::var("X360_TRACE_LEN").ok().and_then(|v| v.parse().ok()).unwrap_or(60000);
                 trace_out = std::fs::File::create(format!("trace_{n}.txt")).ok().map(std::io::BufWriter::new);
                 at_entry = false;
+            }
+            if watch_live {
+                println!("[mark] {:#x} t{}", cpu.pc, kernel.threads[cur].id);
             }
             // keep the LAST 40 hits (the ones nearest a crash), printed when the run ends
             watch_hits += 1;

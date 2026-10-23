@@ -124,7 +124,17 @@ dumps what r4/r6 point at, byte-store aware `X360_WATCH_MEM`, scheduler/kernel/G
 - Tooling: `X360_TRACE_CALLS=N,M` (instruction trace of the Nth visit to the `X360_WATCH` pc, main thread only),
   `cargo build --profile fast` for quick rebuilds.
 
-## Save states and the frame-9604 stall (latest)
+## BREAKTHROUGH: predicated tiling (frame 9604 stall solved)
+- Root cause: the CP ignored **PM4 predication**. Type-3 packets with the predicate bit (header bit 0) must only run when
+  `BIN_SELECT & BIN_MASK != 0`. The driver's per-tile epilogue IB (scratch callback, waits, INTERRUPT) is masked to bit 31,
+  which only the first tile's select (`0x80000003`) has, so real hardware raises ONE interrupt per frame. We ran the
+  epilogue for all 3 tiles; the extra interrupts re-enqueued the tile item for the driver thread forever.
+- Fix: `Gpu::exec_packet` skips predicated type-3 packets when the tile does not intersect the mask
+  (`X360_NO_PREDICATION=1` to disable). Also fixed my own `exec_bin` regression (SELECT_LO/MASK_HI arms).
+- Result: frames advance past 9604 (9835+ in 3 G instructions) and disc I/O jumps from 122 MB to 2 GB: the game moved on
+  from the loading screen into streaming real content.
+
+## Save states and the frame-9604 stall (investigation log)
 - **Save states**: `X360_SAVE_STATE=file,step` / `X360_LOAD_STATE=file` snapshot the whole machine (CPU, kernel, GPU,
   memory; ~430 MB). Resuming takes 0.3 s, so experiments that used to replay 50 G instructions (8 min) now take seconds.
   State files are `*.bin` (git-ignored).

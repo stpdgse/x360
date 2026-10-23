@@ -252,6 +252,12 @@ pub struct Gpu {
     #[serde(skip)]
     ib_logged: u32,
     #[serde(skip)]
+    pred_logged: u32,
+    #[serde(skip)]
+    no_predication: bool,
+    #[serde(skip)]
+    pub predicated_skipped: u64,
+    #[serde(skip)]
     ib_dump_logged: u32,
     #[serde(skip)]
     ring_logged: u32,
@@ -319,6 +325,9 @@ impl Gpu {
             trace_len: std::env::var("X360_TRACE_GPU_LEN").ok().and_then(|s| s.parse().ok()).unwrap_or(u64::MAX),
             zpd_logged: 0,
             ib_logged: 0,
+            pred_logged: 0,
+            no_predication: std::env::var_os("X360_NO_PREDICATION").is_some(),
+            predicated_skipped: 0,
             ib_dump_logged: 0,
             ring_logged: 0,
             bin_logged: 0,
@@ -355,6 +364,7 @@ impl Gpu {
         self.trace_from = fresh.trace_from;
         self.trace_len = fresh.trace_len;
         self.no_irq_hold = fresh.no_irq_hold;
+        self.no_predication = fresh.no_predication;
         self.no_render = fresh.no_render;
         self.sample_every = fresh.sample_every;
         self.snapshot = fresh.snapshot;
@@ -527,6 +537,20 @@ impl Gpu {
             2 => {} // type 2: filler
             _ => {
                 let op = (hdr >> 8) & 0x7F;
+                // Predicated tiling: a type-3 packet with the predicate bit (header bit 0) only runs when the current
+                // tile (BIN_SELECT) intersects the packet's BIN_MASK. The driver's per-tile epilogue (scratch callback,
+                // waits and the INTERRUPT) is masked to the first tile only, so one interrupt fires per frame.
+                if hdr & 1 != 0 && self.pred_logged < 3000 && op == 0x54 && std::env::var_os("X360_LOG_IB").is_some() {
+                    self.pred_logged += 1;
+                    println!("[gpu] predicated {} hdr={hdr:#x} mask={:#x} select={:#x}", opcode_name(op), self.bin_mask, self.bin_select);
+                }
+                if hdr & 1 != 0 && !self.no_predication {
+                    let (m, sel) = if self.bin_mask == 0 && self.bin_select == 0 { (u64::MAX, u64::MAX) } else { (self.bin_mask, self.bin_select) };
+                    if m & sel == 0 {
+                        self.predicated_skipped += 1;
+                        return;
+                    }
+                }
                 if !self.stall_counted {
                     *self.opcode_counts.entry(op).or_insert(0) += 1;
                     if self.tracing() || self.opcode_counts[&op] == 1 {
@@ -545,6 +569,8 @@ impl Gpu {
         let v = body.first().copied().unwrap_or(0) as u64;
         match op {
             0x60 => self.bin_mask = (self.bin_mask & !0xFFFF_FFFF) | v,
+            0x61 => self.bin_mask = (self.bin_mask & 0xFFFF_FFFF) | v << 32,
+            0x62 => self.bin_select = (self.bin_select & !0xFFFF_FFFF) | v,
             _ => self.bin_select = (self.bin_select & 0xFFFF_FFFF) | v << 32,
         }
     }
@@ -663,9 +689,9 @@ impl Gpu {
                 // as a new frame so a stall inside it resumes exactly where it stopped.
                 if body.len() >= 2 {
                     let (addr, size) = (PHYS_VIEW | body[0], body[1] & 0xF_FFFF);
-                    if self.packets >= self.trace_from && self.ib_logged < 60 && std::env::var_os("X360_LOG_IB").is_some() {
+                    if self.packets >= self.trace_from && self.ib_logged < 400 && std::env::var_os("X360_LOG_IB").is_some() {
                         self.ib_logged += 1;
-                        println!("[gpu] IB addr={:#x} size={} (body {:#x},{:#x}) depth={}", body[0], size, body[0], body[1], self.ib_stack.len());
+                        println!("[gpu] IB addr={:#x} size={} depth={} select={:#x} mask={:#x}", body[0], size, self.ib_stack.len(), self.bin_select, self.bin_mask);
                     }
                     let words: Vec<u32> = (0..size).map(|k| mem.read32(addr + k * 4)).collect();
                     if size <= 40 && self.ib_dump_logged < 60 && std::env::var_os("X360_LOG_IB").is_some() {
@@ -721,7 +747,7 @@ impl Gpu {
                     self.hold = true;
                 }
             }
-            0x62 | 0x63 if self.bin_logged < 120 && std::env::var_os("X360_LOG_IB").is_some() => {
+            0x62 | 0x63 if self.bin_logged < 400 && std::env::var_os("X360_LOG_IB").is_some() && (self.ib_stack.is_empty() || (self.bin_select != u64::MAX && self.bin_select != 0xFFFF_FFFF)) => {
                 self.bin_logged += 1;
                 println!("[gpu] {} {:#x} (ib depth {})", opcode_name(op), body.first().copied().unwrap_or(0), self.ib_stack.len());
                 self.exec_bin(op, body);
@@ -974,11 +1000,12 @@ impl Gpu {
         format!(
             "gpu ext-event addresses: {} ; strides: {}
 gpu events: {}
-gpu: {} packets ({} from ring, {} from IBs, {} ring dwords pulled); ring rptr={} pulled={} queued={} ib_depth={} stalled={}; type-3 opcodes: {}\n{}",
+gpu: {} packets ({} predicated-off, {} from ring, {} from IBs, {} ring dwords pulled); ring rptr={} pulled={} queued={} ib_depth={} stalled={}; type-3 opcodes: {}\n{}",
             addr_list.join(" "),
             st_list.join(" "),
             ev_list.join("; "),
             self.packets,
+            self.predicated_skipped,
             self.dbg_ring_packets,
             self.dbg_ib_packets,
             self.dbg_ring_dwords,
