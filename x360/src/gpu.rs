@@ -251,6 +251,12 @@ pub struct Gpu {
     /// Debug counters: ring dwords pulled from guest memory, packets run from the ring, packets run from IBs.
     #[serde(skip)]
     ib_logged: u32,
+    #[serde(skip)]
+    ib_dump_logged: u32,
+    #[serde(skip)]
+    ring_logged: u32,
+    #[serde(skip)]
+    bin_logged: u32,
     /// Set by an INTERRUPT packet: stop pulling packets until the interrupt handler thread has finished.
     #[serde(skip)]
     pub hold: bool,
@@ -313,6 +319,9 @@ impl Gpu {
             trace_len: std::env::var("X360_TRACE_GPU_LEN").ok().and_then(|s| s.parse().ok()).unwrap_or(u64::MAX),
             zpd_logged: 0,
             ib_logged: 0,
+            ib_dump_logged: 0,
+            ring_logged: 0,
+            bin_logged: 0,
             hold: false,
             yield_after: false,
             no_irq_hold: std::env::var_os("X360_NO_IRQ_HOLD").is_some(),
@@ -391,7 +400,7 @@ impl Gpu {
         let wptr = mem.gpu_regs[REG_CP_RB_WPTR] & mask;
         let base = self.ring_virtual();
         if self.pulled != wptr && self.dbg_ring_dwords == 0 && std::env::var_os("X360_LOG_IB").is_some() {
-            println!("[gpu] ring at {base:#x}, {} dwords, wptr {wptr}", mask + 1);
+            println!("[gpu] ring at {base:#x}, {} dwords, wptr {wptr}, rptr writeback {:#x}", mask + 1, self.rptr_writeback);
         }
         while self.pulled != wptr {
             self.dbg_ring_dwords += 1;
@@ -443,6 +452,15 @@ impl Gpu {
             (s[0], s[1..need].to_vec(), need, true)
         };
 
+        if from_ring && self.ring_logged < 150 && std::env::var_os("X360_LOG_RING").is_some() {
+            self.ring_logged += 1;
+            let vals: Vec<String> = body.iter().take(5).map(|v| format!("{v:#x}")).collect();
+            if hdr >> 30 == 3 {
+                println!("[ring] {} {}", opcode_name((hdr >> 8) & 0x7F), vals.join(","));
+            } else if hdr >> 30 == 0 {
+                println!("[ring] type0 reg={:#x} n={} {}", hdr & 0x7FFF, body.len(), vals.join(","));
+            }
+        }
         self.stall_request = false;
         self.pending_ib = None;
         self.exec_packet(mem, hdr, &body);
@@ -520,6 +538,14 @@ impl Gpu {
                 }
                 self.exec_type3(mem, op, body, 0);
             }
+        }
+    }
+
+    fn exec_bin(&mut self, op: u32, body: &[u32]) {
+        let v = body.first().copied().unwrap_or(0) as u64;
+        match op {
+            0x60 => self.bin_mask = (self.bin_mask & !0xFFFF_FFFF) | v,
+            _ => self.bin_select = (self.bin_select & 0xFFFF_FFFF) | v << 32,
         }
     }
 
@@ -641,7 +667,13 @@ impl Gpu {
                         self.ib_logged += 1;
                         println!("[gpu] IB addr={:#x} size={} (body {:#x},{:#x}) depth={}", body[0], size, body[0], body[1], self.ib_stack.len());
                     }
-                    self.pending_ib = Some((0..size).map(|k| mem.read32(addr + k * 4)).collect());
+                    let words: Vec<u32> = (0..size).map(|k| mem.read32(addr + k * 4)).collect();
+                    if size <= 40 && self.ib_dump_logged < 60 && std::env::var_os("X360_LOG_IB").is_some() {
+                        self.ib_dump_logged += 1;
+                        let hex: Vec<String> = words.iter().map(|w| format!("{w:08x}")).collect();
+                        println!("[gpu] IB {:#x} contents: {}", body[0], if body[0] == 0x175d_b800 { format!("mask={} cb={} arg={} flagwait={} {}", hex[1], hex[5], hex[6], hex[9], hex[24]) } else { hex.join(" ") });
+                    }
+                    self.pending_ib = Some(words);
                 }
             }
             0x3C => {
@@ -689,10 +721,12 @@ impl Gpu {
                     self.hold = true;
                 }
             }
-            0x60 => self.bin_mask = (self.bin_mask & !0xFFFF_FFFF) | body.first().copied().unwrap_or(0) as u64,
-            0x61 => self.bin_mask = (self.bin_mask & 0xFFFF_FFFF) | (body.first().copied().unwrap_or(0) as u64) << 32,
-            0x62 => self.bin_select = (self.bin_select & !0xFFFF_FFFF) | body.first().copied().unwrap_or(0) as u64,
-            0x63 => self.bin_select = (self.bin_select & 0xFFFF_FFFF) | (body.first().copied().unwrap_or(0) as u64) << 32,
+            0x62 | 0x63 if self.bin_logged < 120 && std::env::var_os("X360_LOG_IB").is_some() => {
+                self.bin_logged += 1;
+                println!("[gpu] {} {:#x} (ib depth {})", opcode_name(op), body.first().copied().unwrap_or(0), self.ib_stack.len());
+                self.exec_bin(op, body);
+            }
+            0x60..=0x63 => self.exec_bin(op, body),
             0x64 => {
                 // XE_SWAP: ['SWAP', texture fetch constant (6 dwords) of the front buffer, ...]
                 if body.len() >= 7 && body[0] == 0x5041_5753 {

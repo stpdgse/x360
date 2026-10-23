@@ -287,6 +287,11 @@ fn main() {
         .map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect())
         .unwrap_or_default();
     let mut trace_left: u32 = 0;
+    // X360_WATCH_KEEP=<n>: how many X360_WATCH hits to keep (the most recent n), default 60
+    let watch_keep: usize = std::env::var("X360_WATCH_KEEP").ok().and_then(|v| v.parse().ok()).unwrap_or(60);
+    // X360_CP_DELAY=<instructions>: how long freshly written ring commands take to reach the command processor
+    let cp_delay: u64 = std::env::var("X360_CP_DELAY").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let mut cp_due: u64 = 0;
     // X360_TRACE_TID=<id>: which thread X360_TRACE_CALLS records (default: the main thread, 1)
     let trace_tid: u32 = std::env::var("X360_TRACE_TID").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
     let mut trace_out: Option<std::io::BufWriter<std::fs::File>> = None;
@@ -379,19 +384,19 @@ fn main() {
         }
         if !watch.is_empty() && watch.contains(&cpu.pc) {
             if let Some(&n) = trace_calls.iter().find(|&&n| n == watch_hits + 1) {
-                trace_left = 60000;
+                trace_left = std::env::var("X360_TRACE_LEN").ok().and_then(|v| v.parse().ok()).unwrap_or(60000);
                 trace_out = std::fs::File::create(format!("trace_{n}.txt")).ok().map(std::io::BufWriter::new);
                 at_entry = false;
             }
             // keep the LAST 40 hits (the ones nearest a crash), printed when the run ends
             watch_hits += 1;
-            while watch_log.len() >= 60 {
+            while watch_log.len() >= watch_keep {
                 watch_log.pop_front();
             }
             watch_log.push_back(format!(
-                "[watch #{watch_hits} t{} {:#010x}] r3={:#x} r4={:#x} r5={:#x} r6={:#x} r9={:#x} r10={:#x} r11={:#x} r25={:#x} r27={:#x} r28={:#x} r30={:#x} r31={:#x} lr={:#x} sp={:#x}",
+                "[watch #{watch_hits} t{} {:#010x}] r3={:#x} r4={:#x} r5={:#x} r6={:#x} r9={:#x} r10={:#x} r11={:#x} r25={:#x} r27={:#x} r28={:#x} r29={:#x} r30={:#x} r31={:#x} lr={:#x} sp={:#x}",
                 kernel.threads[cur].id, cpu.pc, cpu.gpr[3], cpu.gpr[4], cpu.gpr[5], cpu.gpr[6], cpu.gpr[9], cpu.gpr[10], cpu.gpr[11],
-                cpu.gpr[25], cpu.gpr[27], cpu.gpr[28], cpu.gpr[30], cpu.gpr[31], cpu.lr, cpu.gpr[1]
+                cpu.gpr[25], cpu.gpr[27], cpu.gpr[28], cpu.gpr[29], cpu.gpr[30], cpu.gpr[31], cpu.lr, cpu.gpr[1]
             ));
             // also what r4 and r6 point at (8 words each), when they look like addresses
             // if r3 points at a struct whose first word points at text (a string "FILE"), show that text
@@ -459,8 +464,8 @@ fn main() {
                     mem_watch_log.pop_front();
                 }
                 mem_watch_log.push_back(format!(
-                    "[watchmem #{mem_watch_hits} t{tid}] {a:#010x} <- {v:#010x} by pc={pc_before:#010x} (lr={:#010x}) at step {steps}",
-                    cpu.lr
+                    "[watchmem #{mem_watch_hits} t{tid}] {a:#010x} <- {v:#010x} by pc={pc_before:#010x} (lr={:#010x}) at step {steps} sp={:#x}",
+                    cpu.lr, cpu.gpr[1]
                 ));
             }
             if mem.watch_read.swap(0, std::sync::atomic::Ordering::Relaxed) != 0 {
@@ -474,9 +479,14 @@ fn main() {
                 ));
             }
             if mem.gpu_dirty.swap(false, std::sync::atomic::Ordering::Relaxed) {
-                let t0 = std::time::Instant::now();
-                run_gpu(&mut kernel, &mut mem);
-                gpu_time += t0.elapsed();
+                if cp_delay == 0 {
+                    let t0 = std::time::Instant::now();
+                    run_gpu(&mut kernel, &mut mem);
+                    gpu_time += t0.elapsed();
+                } else if cp_due == 0 {
+                    // New work reaches the CP after a short latency, not within the same instruction
+                    cp_due = steps + cp_delay;
+                }
             }
             if let Some(f) = mem.take_fault() {
                 let kind = if f.write { "write to" } else { "read from" };
@@ -487,9 +497,12 @@ fn main() {
         // A command processor blocked on WAIT_REG_MEM is released by the CPU writing memory, and the CPU may be
         // spinning waiting for the CP in turn. Looking only at scheduling points made every such hand-off cost a
         // whole time slice; polling every few hundred instructions keeps the pair in step.
-        if kernel.gpu.stalled && steps >= next_cp_poll {
+        if (kernel.gpu.stalled || cp_due != 0) && steps >= next_cp_poll {
             next_cp_poll = steps + 400;
-            run_gpu(&mut kernel, &mut mem);
+            if cp_due == 0 || steps >= cp_due {
+                cp_due = 0;
+                run_gpu(&mut kernel, &mut mem);
+            }
         }
         let mut irq_preempt = false;
         if !kernel.gpu.pending_interrupts.is_empty() {

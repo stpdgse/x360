@@ -145,6 +145,17 @@ dumps what r4/r6 point at, byte-store aware `X360_WATCH_MEM`, scheduler/kernel/G
   machine in thread 4 (struct at 0x400ae5c0, work queue at 0x400ae7d4) never reaches its end record.
 - Tooling: `X360_TRACE_TID=<id>` picks the thread for `X360_TRACE_CALLS`, `X360_LOG_IB=1` logs IB calls and the ring base,
   GPU summary counts ring vs IB packets, `X360_NO_IRQ_HOLD=1` disables the CP-waits-for-ISR ordering.
+- Tile-replay anatomy (frame 9605 onwards): the render path switched to **predicated tiling** (3 tiles of 256 rows). The ring
+  holds only `SET_BIN_SELECT`, scene IB `0x175d6160` (5538 dw) and a 29-dword epilogue IB `0x175db800` per tile. The epilogue
+  is: mask `0x80000000`; scratch callback `0x829ddd30` + arg (work item); scratch0=4 (mirrored to memory = the flag at
+  `0x17b0b000`); wait flag==4; `INTERRUPT`; wait flag==0 (the ISR clears it); clear callback; mask all. The ISR runs the
+  callback, which enqueues the item for thread 4. Thread 4 passes alternate "resume-set" / "finish (cancel one pending
+  enqueue)" (counts 1654/1654 per 3308 passes vs 4962 enqueues, i.e. 3 enqueues per 2 passes + 1 cancel), and each
+  pass issues the next tiles, so the loop is self-sustaining: nothing ever makes a pass issue no tile commands.
+  Unresolved: what the real final pass does differently. Tried without effect: CP start delay (`X360_CP_DELAY`), CP hold
+  during ISR (`X360_NO_IRQ_HOLD` to disable), ISR preemption (`X360_IRQ_PREEMPT`), wait scaling, JIT off.
+- More tooling: `X360_LOG_RING=1` (ring packets), `X360_LOG_IB=1` also dumps small IBs and bin selects,
+  `X360_TRACE_LEN`, `X360_WATCH_KEEP=n`, watch lines include r29, watchmem lines include sp.
 - Tooling: `X360_TRACE_GPU_FROM/LEN` bound the packet trace, backtraces list unsignaled multi-wait objects.
 
 ## Honest gaps (not done)
