@@ -1,0 +1,11 @@
+[package]
+name = "xenon-cpu"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cranelift-codegen = "0.137.0"
+cranelift-frontend = "0.137.0"
+cranelift-jit = "0.137.0"
+cranelift-module = "0.137.0"
+cranelift-native = "0.137.0"

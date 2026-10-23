@@ -1,0 +1,9 @@
+﻿[workspace]
+members = ["xenon-cpu", "x360"]
+resolver = "2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = 1
