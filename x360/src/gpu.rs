@@ -252,6 +252,14 @@ pub struct Gpu {
     #[serde(skip)]
     ib_logged: u32,
     #[serde(skip)]
+    tile_logged: u32,
+    #[serde(skip)]
+    resolve_logged: u32,
+    #[serde(skip)]
+    tile_seen: std::collections::HashSet<(u64, u32, u32, u32)>,
+    #[serde(skip)]
+    pub pred_hist: HashMap<(u32, u64, u64), u64>,
+    #[serde(skip)]
     pred_logged: u32,
     #[serde(skip)]
     no_predication: bool,
@@ -325,6 +333,10 @@ impl Gpu {
             trace_len: std::env::var("X360_TRACE_GPU_LEN").ok().and_then(|s| s.parse().ok()).unwrap_or(u64::MAX),
             zpd_logged: 0,
             ib_logged: 0,
+            tile_logged: 0,
+            resolve_logged: 0,
+            tile_seen: std::collections::HashSet::new(),
+            pred_hist: HashMap::new(),
             pred_logged: 0,
             no_predication: std::env::var_os("X360_NO_PREDICATION").is_some(),
             predicated_skipped: 0,
@@ -543,6 +555,9 @@ impl Gpu {
                 if hdr & 1 != 0 && self.pred_logged < 3000 && op == 0x54 && std::env::var_os("X360_LOG_IB").is_some() {
                     self.pred_logged += 1;
                     println!("[gpu] predicated {} hdr={hdr:#x} mask={:#x} select={:#x}", opcode_name(op), self.bin_mask, self.bin_select);
+                }
+                if hdr & 1 != 0 && std::env::var_os("X360_PRED_HIST").is_some() {
+                    *self.pred_hist.entry((op, self.bin_mask, self.bin_select)).or_insert(0) += 1;
                 }
                 if hdr & 1 != 0 && !self.no_predication {
                     let (m, sel) = if self.bin_mask == 0 && self.bin_select == 0 { (u64::MAX, u64::MAX) } else { (self.bin_mask, self.bin_select) };
@@ -895,10 +910,10 @@ impl Gpu {
         if self.sample_every != 0 && self.draws % self.sample_every == 0 {
             let h = |u: &Option<Vec<u32>>| u.as_ref().map(|v| v.iter().fold(0xcbf29ce484222325u64, |a, w| (a ^ *w as u64).wrapping_mul(0x100000001b3))).unwrap_or(0);
             println!(
-                "[draw #{}] prim {} src {} count {} mode {} vs {:016x} ps {:016x} colorinfo {:#x} edram_base {:#x} scissor {:#x}/{:#x}",
-                self.draws, prim, src_sel, count, mode, h(&self.renderer.vs), h(&self.renderer.ps),
+                "[draw #{}] f{} prim {} src {} count {} mode {} vs {:016x} ps {:016x} colorinfo {:#x} edram_base {:#x} scissor {:#x}/{:#x} blend {:#x} depthctl {:#x} cullmode {:#x} cmask {:#x}",
+                self.draws, self.frames, prim, src_sel, count, mode, h(&self.renderer.vs), h(&self.renderer.ps),
                 mem.gpu_regs[REG_RB_COLOR_INFO], mem.gpu_regs[REG_RB_COLOR_INFO] & 0xFFF,
-                mem.gpu_regs[0x2081], mem.gpu_regs[0x2082]
+                mem.gpu_regs[0x2081], mem.gpu_regs[0x2082], mem.gpu_regs[0x2201], mem.gpu_regs[0x2200], mem.gpu_regs[0x2205], mem.gpu_regs[0x2104]
             );
         }
 
@@ -934,12 +949,30 @@ impl Gpu {
         };
 
         // ---- execute ----
+        if self.tile_logged < 400 && self.bin_select != u64::MAX && self.bin_select != 0xFFFF_FFFF && self.tile_seen.insert((self.bin_select, mem.gpu_regs[0x2081], mem.gpu_regs[0x2082], mem.gpu_regs[0x2080])) && std::env::var_os("X360_LOG_TILE_REGS").is_some() {
+            self.tile_logged += 1;
+            let r = |i: usize| mem.gpu_regs[i];
+            println!(
+                "[tile] select={:#x} mask={:#x} prim={prim} n={} WIN_OFFSET={:#x} WIN_SCISSOR={:#x}/{:#x} SCREEN_SCISSOR={:#x}/{:#x} SURFACE_INFO={:#x} COLOR_INFO={:#x} VPORT x({}*,{}+) y({}*,{}+) CLIP={:#x}",
+                self.bin_select, self.bin_mask, indices.len(), r(0x2080), r(0x2081), r(0x2082), r(0x200E), r(0x200F), r(0x2000), r(0x2001),
+                f32::from_bits(r(0x210F)), f32::from_bits(r(0x2110)), f32::from_bits(r(0x2111)), f32::from_bits(r(0x2112)), r(0x2204)
+            );
+        }
+        if mode == 6 && self.resolve_logged < 400 && std::env::var_os("X360_LOG_RESOLVES").is_some() {
+            self.resolve_logged += 1;
+            let r = &mem.gpu_regs;
+            println!(
+                "[resolve] f{} prim {} select={:#x} COPY_CONTROL={:#x} DEST_BASE={:#x} DEST_PITCH={:#x} DEST_INFO={:#x} DEST_OFFSET={:#x} WIN_OFFSET={:#x} WIN_SCISSOR={:#x}/{:#x} SURFACE_INFO={:#x} COLOR_INFO={:#x} COLOR_CLEAR={:#x} DEPTH_CLEAR={:#x}",
+                self.frames, prim, self.bin_select, r[0x2318], r[0x2319], r[0x231A], r[0x231B], r[0x231C], r[0x2080], r[0x2081], r[0x2082], r[0x2000], r[0x2001], r[0x231E], r[0x231D]
+            );
+        }
         let regs = std::mem::take(&mut mem.gpu_regs);
         match mode {
             // X360_NO_RENDER=1 skips all pixel work (command stream still decoded): much faster
             // when only CPU / kernel progress matters. Frames come out black.
-            4 if !self.no_render => {
-                self.renderer.draw(mem, &regs, prim, &indices);
+            // RB_MODECONTROL: 4 = colour + depth draw, 5 = depth-only draw, 6 = EDRAM copy (resolve)
+            4 | 5 if !self.no_render => {
+                self.renderer.draw(mem, &regs, prim, &indices, mode == 5);
                 if let Some((_, n, dir)) = self.snapshot.clone() {
                     self.snapshot_draws += 1;
                     if self.snapshot_draws == n {
@@ -954,13 +987,13 @@ impl Gpu {
                     }
                 }
             }
-            5 if !self.no_render => self.renderer.resolve(mem, &regs),
+            6 if !self.no_render => self.renderer.resolve(mem, &regs),
             _ => {}
         }
         mem.gpu_regs = regs;
         let r = |i: usize| mem.gpu_regs[i];
         // Copies (edram_mode 5) are the resolves we most need to understand: always log those.
-        if mode == 5 && self.copy_log_budget > 0 {
+        if mode == 6 && self.copy_log_budget > 0 {
             self.copy_log_budget -= 1;
             println!(
                 "[gpu] COPY at draw #{}: {} x{} | color_info={:#x} surface={:#x} | ctl={:#x} dest_base={:#x} dest_pitch={:#x} dest_info={:#x} slice={:#x} | clear color={:#x} depth={:#x} | vport scale={:.1}x{:.1} off={:.1},{:.1}",
@@ -997,6 +1030,13 @@ impl Gpu {
         st.sort_by(|a, b| b.1.cmp(a.1));
         let st_list: Vec<String> = st.iter().take(8).map(|(d, n)| format!("{d:+#x}x{n}")).collect();
         let addr_list: Vec<String> = self.ext_addrs.iter().map(|a| format!("{a:#x}")).collect();
+        if std::env::var_os("X360_PRED_HIST").is_some() {
+            let mut h: Vec<_> = self.pred_hist.iter().collect();
+            h.sort_by(|a, b| b.1.cmp(a.1));
+            for ((op, m, sel), n) in h.iter().take(30) {
+                println!("[pred] {:<18} mask={:#x} select={:#x} x{}", opcode_name(*op), m, sel, n);
+            }
+        }
         format!(
             "gpu ext-event addresses: {} ; strides: {}
 gpu events: {}
@@ -1157,6 +1197,9 @@ mod tests {
         g.process(&mut mem);
         assert_eq!(mem.read32(PHYS_VIEW | out), 0x77);
         assert_eq!(g.pending_interrupts, vec![1]);
+        // the CP yields after an INTERRUPT (the handler must run before it continues); the next call resumes
+        assert!(g.stalled);
+        g.process(&mut mem);
         assert_eq!(g.bin_mask, 0xF);
         assert_eq!(g.bin_select, 0x3_0000_0000);
     }

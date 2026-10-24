@@ -8,7 +8,9 @@
 use serde::{Deserialize, Serialize};
 use crate::gpu::{tiled_offset_2d, PHYS_VIEW};
 use crate::memory::GuestMemory;
-use crate::xenos_tex::TextureSampler;
+use crate::xenos_tex::{TexDesc, TextureSampler};
+use crate::xenos_texcache::{DecodedTex, TexCache};
+use std::sync::{Arc, Mutex, OnceLock};
 use crate::xenos_vm::{Consts, Invocation, ShaderIo, ShaderKind, TextureFetch, VertexFetch, Vm};
 use std::collections::HashMap;
 use xenon_cpu::memory::Bus;
@@ -31,6 +33,19 @@ const REG_COPY_DEST_PITCH: usize = 0x231A;
 const REG_COPY_CONTROL: usize = 0x2318;
 const REG_COLOR_CLEAR: usize = 0x231E;
 const REG_VERTEX_FETCH_CONSTS: usize = 0x4800;
+const REG_DEPTH_INFO: usize = 0x2002;
+const REG_DEPTHCONTROL: usize = 0x2200;
+const REG_STENCILREFMASK: usize = 0x210D;
+const REG_VPORT_ZSCALE: usize = 0x2113;
+const REG_VPORT_ZOFFSET: usize = 0x2114;
+const REG_DEPTH_CLEAR: usize = 0x231D;
+
+/// X360_RENDER_SCALE=0.5 renders at that fraction of the console resolution (resolves scale back up), a large
+/// speed-up for development. Default 1.0 = exact.
+pub fn render_scale() -> f32 {
+    static SCALE: OnceLock<f32> = OnceLock::new();
+    *SCALE.get_or_init(|| std::env::var("X360_RENDER_SCALE").ok().and_then(|v| v.parse::<f32>().ok()).filter(|v| *v > 0.0 && *v <= 1.0).unwrap_or(1.0))
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Surface {
@@ -45,6 +60,116 @@ impl Surface {
     }
 }
 
+/// Depth (f32, 0..1) and stencil planes for one EDRAM depth base, the same size as the colour target.
+pub struct DepthSurface {
+    pub width: u32,
+    pub height: u32,
+    pub z: Vec<f32>,
+    pub s: Vec<u8>,
+}
+
+impl DepthSurface {
+    fn new(width: u32, height: u32, fill_z: f32) -> Self {
+        Self { width, height, z: vec![fill_z; (width * height) as usize], s: vec![0; (width * height) as usize] }
+    }
+
+    fn grow(&mut self, w: u32, h: u32, fill_z: f32) {
+        if self.width >= w && self.height >= h {
+            return;
+        }
+        let (nw, nh) = (self.width.max(w), self.height.max(h));
+        let mut g = DepthSurface::new(nw, nh, fill_z);
+        for y in 0..self.height {
+            let (a, b) = ((y * self.width) as usize, (y * nw) as usize);
+            g.z[b..b + self.width as usize].copy_from_slice(&self.z[a..a + self.width as usize]);
+            g.s[b..b + self.width as usize].copy_from_slice(&self.s[a..a + self.width as usize]);
+        }
+        *self = g;
+    }
+}
+
+/// Compare function codes shared by depth and stencil tests: never, <, ==, <=, >, !=, >=, always.
+#[inline]
+fn cmp_f32(func: u32, a: f32, b: f32) -> bool {
+    match func & 7 {
+        0 => false,
+        1 => a < b,
+        2 => a == b,
+        3 => a <= b,
+        4 => a > b,
+        5 => a != b,
+        6 => a >= b,
+        _ => true,
+    }
+}
+
+#[inline]
+fn cmp_u32(func: u32, a: u32, b: u32) -> bool {
+    match func & 7 {
+        0 => false,
+        1 => a < b,
+        2 => a == b,
+        3 => a <= b,
+        4 => a > b,
+        5 => a != b,
+        6 => a >= b,
+        _ => true,
+    }
+}
+
+fn stencil_op(op: u32, old: u8, reference: u8) -> u8 {
+    match op & 7 {
+        0 => old,
+        1 => 0,
+        2 => reference,
+        3 => old.saturating_add(1),
+        4 => old.saturating_sub(1),
+        5 => !old,
+        6 => old.wrapping_add(1),
+        _ => old.wrapping_sub(1),
+    }
+}
+
+/// Depth/stencil state of one draw, decoded from registers.
+#[derive(Clone, Copy)]
+struct DepthState {
+    z_enable: bool,
+    z_write: bool,
+    z_func: u32,
+    stencil_enable: bool,
+    s_func: u32,
+    s_fail: u32,
+    s_zpass: u32,
+    s_zfail: u32,
+    s_ref: u8,
+    s_mask: u8,
+    s_wmask: u8,
+}
+
+impl DepthState {
+    fn from_regs(regs: &[u32]) -> Self {
+        let d = regs[REG_DEPTHCONTROL];
+        let sr = regs[REG_STENCILREFMASK];
+        Self {
+            z_enable: d & 2 != 0,
+            z_write: d & 4 != 0,
+            z_func: (d >> 4) & 7,
+            stencil_enable: d & 1 != 0,
+            s_func: (d >> 8) & 7,
+            s_fail: (d >> 11) & 7,
+            s_zpass: (d >> 14) & 7,
+            s_zfail: (d >> 17) & 7,
+            s_ref: sr as u8,
+            s_mask: (sr >> 8) as u8,
+            s_wmask: (sr >> 16) as u8,
+        }
+    }
+
+    fn active(&self) -> bool {
+        self.z_enable || self.stencil_enable
+    }
+}
+
 #[derive(Default, Serialize, Deserialize)]
 pub struct Renderer {
     /// Colour render targets by EDRAM base (RB_COLOR_INFO[11:0]).
@@ -55,14 +180,43 @@ pub struct Renderer {
     pub triangles: u64,
     pub pixels_shaded: u64,
     pub resolves: u64,
+    /// Profile (host time): whole draw calls, their vertex stage, their raster+pixel stage, and resolves.
+    #[serde(skip)]
+    pub t_draw: std::time::Duration,
+    #[serde(skip)]
+    pub t_vertex: std::time::Duration,
+    #[serde(skip)]
+    pub t_raster: std::time::Duration,
+    #[serde(skip)]
+    pub t_resolve: std::time::Duration,
+    #[serde(skip)]
+    pub verts_shaded: u64,
+    #[serde(skip)]
+    pub last_covered: u64,
+    #[serde(skip)]
+    pub last_rej_s: u64,
+    #[serde(skip)]
+    pub last_rej_z: u64,
+    /// Depth/stencil planes by EDRAM depth base (not saved in save states; rebuilt as the game draws).
+    #[serde(skip)]
+    pub depths: HashMap<u32, DepthSurface>,
+    /// Decoded textures shared by every draw (and every raster thread).
+    #[serde(skip)]
+    pub tex_cache: Mutex<TexCache>,
     /// Things we skipped or didn't understand, counted by reason, for the end-of-run summary.
     pub skipped: HashMap<String, u64>,
 }
 
 /// Vertex/texture memory access for the shader VM.
+type TexSlot = (TexDesc, Arc<Option<DecodedTex>>);
+
 struct GpuIo<'a> {
     mem: &'a GuestMemory,
     regs: &'a [u32],
+    /// Shared decoded-texture cache, or None for tiny draws where decoding a whole texture isn't worth it.
+    cache: Option<&'a Mutex<TexCache>>,
+    /// Per-draw lazily resolved texture slots (fetch constants 0..31).
+    slots: &'a [OnceLock<TexSlot>; 32],
 }
 
 pub fn apply_endian(raw_be: u32, mode: u32) -> u32 {
@@ -176,6 +330,23 @@ impl ShaderIo for GpuIo<'_> {
     }
 
     fn texture_fetch(&mut self, f: &TextureFetch, coords: [f32; 3]) -> [f32; 4] {
+        if let Some(cache) = self.cache {
+            let slot = self.slots[(f.constant & 31) as usize].get_or_init(|| {
+                let desc = TexDesc::from_regs(self.regs, f.constant);
+                let tex = cache.lock().unwrap().get(self.mem, &desc);
+                (desc, tex)
+            });
+            if let Some(tex) = slot.1.as_ref() {
+                let desc = &slot.0;
+                let (mut u, mut v) = (coords[0], coords[1]);
+                if f.unnormalized {
+                    u /= desc.width as f32;
+                    v /= desc.height as f32;
+                }
+                let filter = if f.mag_filter == 3 { desc.mag_filter } else { f.mag_filter };
+                return tex.sample(desc, u, v, filter == 1);
+            }
+        }
         let sampler = TextureSampler { mem: self.mem, regs: self.regs };
         let desc = crate::xenos_tex::TexDesc::from_regs(self.regs, f.constant);
         let (mut u, mut v) = (coords[0], coords[1]);
@@ -253,12 +424,58 @@ impl Renderer {
     fn surface(&mut self, regs: &[u32]) -> &mut Surface {
         let base = regs[REG_COLOR_INFO] & 0xFFF;
         let br = regs[REG_WINDOW_SCISSOR_BR];
-        let (w, h) = ((br & 0x7FFF).clamp(1, 2560), ((br >> 16) & 0x7FFF).clamp(1, 1440));
-        self.surfaces.entry(base).or_insert_with(|| Surface::new(w, h))
+        let sc = render_scale();
+        let (fw, fh) = ((br & 0x7FFF).clamp(1, 2560), ((br >> 16) & 0x7FFF).clamp(1, 1440));
+        let (w, h) = (((fw as f32 * sc).ceil() as u32).max(1), ((fh as f32 * sc).ceil() as u32).max(1));
+        let s = self.surfaces.entry(base).or_insert_with(|| Surface::new(w, h));
+        // Predicated tiling draws each tile with a scissor covering only that tile's rows of one full-frame
+        // surface, so a surface created by the first tile must grow when a later tile reaches further.
+        if s.width < w || s.height < h {
+            let (nw, nh) = (s.width.max(w), s.height.max(h));
+            let mut grown = Surface::new(nw, nh);
+            for y in 0..s.height {
+                let (a, b) = ((y * s.width) as usize, (y * nw) as usize);
+                grown.px[b..b + s.width as usize].copy_from_slice(&s.px[a..a + s.width as usize]);
+            }
+            *s = grown;
+        }
+        s
     }
 
     /// Execute one draw call into the bound colour render target.
-    pub fn draw(&mut self, mem: &GuestMemory, regs: &[u32], prim: u32, indices: &[u32]) {
+    pub fn draw(&mut self, mem: &GuestMemory, regs: &[u32], prim: u32, indices: &[u32], depth_only: bool) {
+        let t0 = std::time::Instant::now();
+        let shaded0 = self.pixels_shaded;
+        let tris0 = self.triangles;
+        self.draw_inner(mem, regs, prim, indices, depth_only);
+        let el = t0.elapsed();
+        self.t_draw += el;
+        if el.as_millis() > 300 && std::env::var_os("X360_LOG_SLOW_DRAWS").is_some() {
+            let shaded = self.pixels_shaded - shaded0;
+            println!(
+                "[slow draw] {:.0?}: prim {prim} {} indices, {} triangles, {} px covered, {} stencil-rejected, {} depth-rejected, {} pixels shaded ({:.0} ns/px) depthctl {:#x} stencilref {:#x} depth_info {:#x}, ps {:016x}",
+                el,
+                indices.len(),
+                self.triangles - tris0,
+                self.last_covered,
+                self.last_rej_s,
+                self.last_rej_z,
+                shaded,
+                el.as_nanos() as f64 / shaded.max(1) as f64,
+                regs[REG_DEPTHCONTROL],
+                regs[REG_STENCILREFMASK],
+                regs[REG_DEPTH_INFO],
+                self.ps.as_ref().map(|p| p.iter().fold(0u64, |h, w| h.wrapping_mul(0x100000001b3).wrapping_add(*w as u64))).unwrap_or(0)
+            );
+            if std::env::var_os("X360_LOG_SLOW_DRAWS").map(|v| v == "2").unwrap_or(false) {
+                if let Some(ps) = &self.ps {
+                    println!("{}", crate::xenos_vm::disassemble(ps));
+                }
+            }
+        }
+    }
+
+    fn draw_inner(&mut self, mem: &GuestMemory, regs: &[u32], prim: u32, indices: &[u32], depth_only: bool) {
         let (Some(vs), Some(ps)) = (self.vs.clone(), self.ps.clone()) else {
             self.skip("draw without both shaders");
             return;
@@ -274,7 +491,9 @@ impl Renderer {
         let vte = regs[REG_VTE_CNTL];
         let f = |i: usize| f32::from_bits(regs[i]);
         let (xs, xo, ys, yo) = (f(REG_VPORT_XSCALE), f(REG_VPORT_XOFFSET), f(REG_VPORT_YSCALE), f(REG_VPORT_YOFFSET));
-        let mut io = GpuIo { mem, regs };
+        let (zs, zo) = (f(REG_VPORT_ZSCALE), f(REG_VPORT_ZOFFSET));
+        let slots: [OnceLock<TexSlot>; 32] = std::array::from_fn(|_| OnceLock::new());
+        let mut io = GpuIo { mem, regs, cache: None, slots: &slots };
         let mut fetch_vertex = |idx: u32, io: &mut GpuIo<'_>| -> Option<Vertex> {
             if let Some(v) = cache.get(&idx) {
                 return Some(*v);
@@ -307,12 +526,20 @@ impl Renderer {
             if vte & 8 != 0 {
                 y += yo;
             }
-            let v = Vertex { x, y, z, inv_w, interp: inv.exports.interpolators };
+            if vte & 0x10 != 0 {
+                z *= zs;
+            }
+            if vte & 0x20 != 0 {
+                z += zo;
+            }
+            let sc = render_scale();
+            let v = Vertex { x: x * sc, y: y * sc, z, inv_w, interp: inv.exports.interpolators };
             cache.insert(idx, v);
             Some(v)
         };
 
         // ---- primitive assembly: list of triangles ----
+        let t_v = std::time::Instant::now();
         let n = indices.len();
         let mut tri_idx: Vec<[usize; 3]> = Vec::new();
         let mut extra: Vec<Vertex> = Vec::new(); // synthesized vertices (rect list 4th corner)
@@ -360,14 +587,19 @@ impl Renderer {
             _ => {}
         }
         verts.extend(extra);
+        self.verts_shaded += cache.len() as u64;
+        self.t_vertex += t_v.elapsed();
+        let t_r = std::time::Instant::now();
 
         // ---- raster state ----
         let scissor_tl = regs[REG_WINDOW_SCISSOR_TL];
         let scissor_br = regs[REG_WINDOW_SCISSOR_BR];
-        let (sx0, sy0) = ((scissor_tl & 0x7FFF) as i32, ((scissor_tl >> 16) & 0x7FFF) as i32);
-        let (sx1, sy1) = ((scissor_br & 0x7FFF) as i32, ((scissor_br >> 16) & 0x7FFF) as i32);
+        let sc = render_scale();
+        let scl = |v: u32, up: bool| if up { (v as f32 * sc).ceil() as i32 } else { (v as f32 * sc).floor() as i32 };
+        let (sx0, sy0) = (scl(scissor_tl & 0x7FFF, false), scl((scissor_tl >> 16) & 0x7FFF, false));
+        let (sx1, sy1) = (scl(scissor_br & 0x7FFF, true), scl((scissor_br >> 16) & 0x7FFF, true));
         let blend_ctl = regs[REG_BLENDCONTROL0];
-        let write_mask = regs[REG_COLOR_MASK] & 0xF;
+        let write_mask = if depth_only { 0 } else { regs[REG_COLOR_MASK] & 0xF };
         let consts = Consts { regs, float_base: 256 };
         let ps_vm = Vm::new(&ps, ShaderKind::Pixel, consts);
 
@@ -378,14 +610,47 @@ impl Renderer {
         let (w, h) = (surf.width as i32, surf.height as i32);
         self.draws_rasterized += 1;
 
+        // depth/stencil target (only when the draw tests or writes it)
+        let dstate = DepthState::from_regs(regs);
+        let depth_key = regs[REG_DEPTH_INFO] & 0xFFF;
+        let far_fill = if matches!(dstate.z_func, 4 | 6) { 0.0 } else { 1.0 };
+        let mut depth = if dstate.active() {
+            let mut d = self.depths.remove(&depth_key).unwrap_or_else(|| DepthSurface::new(surf.width, surf.height, far_fill));
+            d.grow(surf.width, surf.height, far_fill);
+            Some(d)
+        } else {
+            None
+        };
+        let dwidth = depth.as_ref().map(|d| d.width as i32).unwrap_or(w);
+        debug_assert!(depth.is_none() || dwidth == w || true);
+
         self.triangles += tri_idx.len() as u64;
+
+        // Rough cost: total clipped bounding-box area. Small draws stay on this thread (spawning isn't free).
+        let work: i64 = tri_idx
+            .iter()
+            .map(|t| {
+                let (a, b, c) = (verts[t[0]], verts[t[1]], verts[t[2]]);
+                let wd = (a.x.max(b.x).max(c.x).ceil().min(sx1.min(w) as f32) - a.x.min(b.x).min(c.x).floor().max(0.0)).max(0.0) as i64;
+                let ht = (a.y.max(b.y).max(c.y).ceil().min(sy1.min(h) as f32) - a.y.min(b.y).min(c.y).floor().max(0.0)).max(0.0) as i64;
+                wd * ht
+            })
+            .sum();
+        let tex_cache = &self.tex_cache;
+        let use_cache = work >= 16;
+        let rej_s = std::sync::atomic::AtomicU64::new(0);
+        let rej_z = std::sync::atomic::AtomicU64::new(0);
+        let covered = std::sync::atomic::AtomicU64::new(0);
+        // Depth-only passes (RB_MODECONTROL = 5) with a tiny pixel shader only need the depth/stencil update.
+        let skip_ps = depth_only && ps.len() <= 12;
 
         // Rasterize rows [y0, y1) of the surface into `rows` (the pixels of exactly those rows) for every
         // triangle, in order. Rows are independent, so large draws are split into bands run on separate
         // threads with results identical to the serial order. Returns pixels shaded.
-        let shade_rows = |y0: i32, y1: i32, rows: &mut [[f32; 4]]| -> u64 {
-            let mut io = GpuIo { mem, regs };
+        let shade_rows = |y0: i32, y1: i32, rows: &mut [[f32; 4]], mut drows: Option<(&mut [f32], &mut [u8])>| -> u64 {
+            let mut io = GpuIo { mem, regs, cache: if use_cache { Some(tex_cache) } else { None }, slots: &slots };
             let mut shaded = 0u64;
+            let (mut covered_local, mut rej_s_local, mut rej_z_local) = (0u64, 0u64, 0u64);
             for t in &tri_idx {
                 let (a, b, c) = (verts[t[0]], verts[t[1]], verts[t[2]]);
                 let area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
@@ -407,6 +672,30 @@ impl Renderer {
                         if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
                             continue;
                         }
+                        // early depth/stencil test (screen-space z is affine in the barycentrics)
+                        let di = ((py - y0) * w + px) as usize;
+                        let pz = w0 * a.z + w1 * b.z + w2 * c.z;
+                        covered_local += 1;
+                        if let Some((zrow, srow)) = drows.as_mut() {
+                            let (old_z, old_s) = (zrow[di], srow[di]);
+                            if dstate.stencil_enable {
+                                let pass = cmp_u32(dstate.s_func, (dstate.s_ref & dstate.s_mask) as u32, (old_s & dstate.s_mask) as u32);
+                                if !pass {
+                                    rej_s_local += 1;
+                                    let n = stencil_op(dstate.s_fail, old_s, dstate.s_ref);
+                                    srow[di] = (old_s & !dstate.s_wmask) | (n & dstate.s_wmask);
+                                    continue;
+                                }
+                            }
+                            if dstate.z_enable && !cmp_f32(dstate.z_func, pz, old_z) {
+                                rej_z_local += 1;
+                                if dstate.stencil_enable {
+                                    let n = stencil_op(dstate.s_zfail, old_s, dstate.s_ref);
+                                    srow[di] = (old_s & !dstate.s_wmask) | (n & dstate.s_wmask);
+                                }
+                                continue;
+                            }
+                        }
                         // perspective-correct interpolation
                         let (p0, p1, p2) = (w0 * a.inv_w, w1 * b.inv_w, w2 * c.inv_w);
                         let denom = p0 + p1 + p2;
@@ -417,10 +706,22 @@ impl Renderer {
                                 inv.r[k][ch] = a.interp[k][ch] * q0 + b.interp[k][ch] * q1 + c.interp[k][ch] * q2;
                             }
                         }
-                        if ps_vm.run(&mut inv, &mut io).is_err() || inv.killed {
+                        if !skip_ps && (ps_vm.run(&mut inv, &mut io).is_err() || inv.killed) {
                             continue;
                         }
                         shaded += 1;
+                        if let Some((zrow, srow)) = drows.as_mut() {
+                            if dstate.stencil_enable {
+                                let n = stencil_op(dstate.s_zpass, srow[di], dstate.s_ref);
+                                srow[di] = (srow[di] & !dstate.s_wmask) | (n & dstate.s_wmask);
+                            }
+                            if dstate.z_enable && dstate.z_write {
+                                zrow[di] = pz;
+                            }
+                        }
+                        if skip_ps {
+                            continue;
+                        }
                         let src = inv.exports.colors[0];
                         let dst = &mut rows[((py - y0) * w + px) as usize];
                         let blended = blend(blend_ctl, src, *dst);
@@ -432,45 +733,66 @@ impl Renderer {
                     }
                 }
             }
+            covered.fetch_add(covered_local, std::sync::atomic::Ordering::Relaxed);
+            rej_s.fetch_add(rej_s_local, std::sync::atomic::Ordering::Relaxed);
+            rej_z.fetch_add(rej_z_local, std::sync::atomic::Ordering::Relaxed);
             shaded
         };
 
-        // Rough cost: total clipped bounding-box area. Small draws stay on this thread (spawning isn't free).
-        let work: i64 = tri_idx
-            .iter()
-            .map(|t| {
-                let (a, b, c) = (verts[t[0]], verts[t[1]], verts[t[2]]);
-                let wd = (a.x.max(b.x).max(c.x).ceil().min(sx1.min(w) as f32) - a.x.min(b.x).min(c.x).floor().max(0.0)).max(0.0) as i64;
-                let ht = (a.y.max(b.y).max(c.y).ceil().min(sy1.min(h) as f32) - a.y.min(b.y).min(c.y).floor().max(0.0)).max(0.0) as i64;
-                wd * ht
-            })
-            .sum();
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(8);
         if threads > 1 && work > 40_000 && h >= threads as i32 {
             let band = ((h as usize + threads - 1) / threads) as i32;
             let shaded: u64 = std::thread::scope(|sc| {
                 let shade_rows = &shade_rows;
+                let chunk = (band * w) as usize;
+                let (mut zc, mut sc2): (Vec<Option<&mut [f32]>>, Vec<Option<&mut [u8]>>) = match depth.as_mut() {
+                    Some(d) => (d.z.chunks_mut(chunk).map(Some).collect(), d.s.chunks_mut(chunk).map(Some).collect()),
+                    None => (Vec::new(), Vec::new()),
+                };
                 let handles: Vec<_> = surf
                     .px
-                    .chunks_mut((band * w) as usize)
+                    .chunks_mut(chunk)
                     .enumerate()
                     .map(|(k, rows)| {
                         let y0 = k as i32 * band;
                         let y1 = (y0 + band).min(h);
-                        sc.spawn(move || shade_rows(y0, y1, rows))
+                        let dr = match (zc.get_mut(k).and_then(|z| z.take()), sc2.get_mut(k).and_then(|s| s.take())) {
+                            (Some(z), Some(s)) => Some((z, s)),
+                            _ => None,
+                        };
+                        sc.spawn(move || shade_rows(y0, y1, rows, dr))
                     })
                     .collect();
                 handles.into_iter().map(|hd| hd.join().unwrap()).sum()
             });
             self.pixels_shaded += shaded;
         } else {
-            self.pixels_shaded += shade_rows(0, h, &mut surf.px);
+            let dr = depth.as_mut().map(|d| (&mut d.z[..], &mut d.s[..]));
+            self.pixels_shaded += shade_rows(0, h, &mut surf.px, dr);
+        }
+        self.last_covered = covered.load(std::sync::atomic::Ordering::Relaxed);
+        self.last_rej_s = rej_s.load(std::sync::atomic::Ordering::Relaxed);
+        self.last_rej_z = rej_z.load(std::sync::atomic::Ordering::Relaxed);
+        if let Some(d) = depth {
+            self.depths.insert(depth_key, d);
         }
         self.surfaces.insert(key, surf);
+        self.t_raster += t_r.elapsed();
     }
 
     /// EDRAM resolve: copy the bound render target to guest memory as tiled 8:8:8:8.
     pub fn resolve(&mut self, mem: &mut GuestMemory, regs: &[u32]) {
+        let t0 = std::time::Instant::now();
+        self.resolve_inner(mem, regs);
+        let el = t0.elapsed();
+        self.t_resolve += el;
+        if el.as_millis() >= 5 && std::env::var_os("X360_LOG_SLOW_DRAWS").is_some() {
+            let pitch_h = regs[REG_COPY_DEST_PITCH];
+            println!("[slow resolve] {el:.1?}: dest {}x{} src surface {:#x}", pitch_h & 0x3FFF, (pitch_h >> 16) & 0x3FFF, regs[REG_COLOR_INFO] & 0xFFF);
+        }
+    }
+
+    fn resolve_inner(&mut self, mem: &mut GuestMemory, regs: &[u32]) {
         let key = regs[REG_COLOR_INFO] & 0xFFF;
         let dest = regs[REG_COPY_DEST_BASE] & 0x1FFF_F000;
         let pitch_h = regs[REG_COPY_DEST_PITCH];
@@ -485,13 +807,23 @@ impl Renderer {
         };
         let to8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u32;
         let base = PHYS_VIEW | dest;
-        for y in 0..height.min(surf.height) {
-            for x in 0..pitch.min(surf.width) {
-                let p = surf.px[(y * surf.width + x) as usize];
-                // bytes in memory order R, G, B, A (little-endian dword A<<24|B<<16|G<<8|R, endian "none")
-                let dword = to8(p[0]) | (to8(p[1]) << 8) | (to8(p[2]) << 16) | (to8(p[3]) << 24);
-                let off = tiled_offset_2d(x, y, pitch, 2);
-                mem.write_bytes(base + off, &dword.to_le_bytes());
+        let sc = render_scale();
+        // Copy region = the window scissor (per-tile copies use their own rows), clipped to the destination size.
+        let (tl, br) = (regs[REG_WINDOW_SCISSOR_TL], regs[REG_WINDOW_SCISSOR_BR]);
+        let (rx0, ry0) = ((tl & 0x7FFF).min(pitch), ((tl >> 16) & 0x7FFF).min(height));
+        let (rx1, ry1) = ((br & 0x7FFF).min(pitch), ((br >> 16) & 0x7FFF).min(height));
+        let (rx0, ry0, rx1, ry1) = if rx1 <= rx0 || ry1 <= ry0 { (0, 0, pitch, height) } else { (rx0, ry0, rx1, ry1) };
+        let full_w = ((surf.width as f32 / sc).round() as u32).min(rx1);
+        let full_h = ((surf.height as f32 / sc).round() as u32).min(ry1);
+        for y in ry0..full_h {
+            let sy = (((y as f32 + 0.5) * sc) as u32).min(surf.height - 1);
+            let row = &surf.px[(sy * surf.width) as usize..((sy + 1) * surf.width) as usize];
+            for x in rx0..full_w {
+                let sx = (((x as f32 + 0.5) * sc) as u32).min(surf.width - 1);
+                let p = row[sx as usize];
+                // bytes in memory order R, G, B, A (endian "none")
+                let bytes = [to8(p[0]) as u8, to8(p[1]) as u8, to8(p[2]) as u8, to8(p[3]) as u8];
+                mem.write32(base + tiled_offset_2d(x, y, pitch, 2), u32::from_be_bytes(bytes));
             }
         }
         // optional colour clear after the copy
@@ -499,7 +831,20 @@ impl Renderer {
             let c = regs[REG_COLOR_CLEAR];
             let clear = [(c & 0xFF) as f32 / 255.0, ((c >> 8) & 0xFF) as f32 / 255.0, ((c >> 16) & 0xFF) as f32 / 255.0, (c >> 24) as f32 / 255.0];
             if let Some(s) = self.surfaces.get_mut(&key) {
-                s.px.iter_mut().for_each(|p| *p = clear);
+                let (cx0, cx1) = (((rx0 as f32 * sc) as u32).min(s.width), (((rx1 as f32 * sc).ceil()) as u32).min(s.width));
+                let (cy0, cy1) = (((ry0 as f32 * sc) as u32).min(s.height), (((ry1 as f32 * sc).ceil()) as u32).min(s.height));
+                for y in cy0..cy1 {
+                    s.px[(y * s.width + cx0) as usize..(y * s.width + cx1) as usize].iter_mut().for_each(|p| *p = clear);
+                }
+            }
+        }
+        // optional depth/stencil clear after the copy
+        if regs[REG_COPY_CONTROL] & (1 << 9) != 0 {
+            let v = regs[REG_DEPTH_CLEAR];
+            let (z, st) = ((v >> 8) as f32 / 16_777_215.0, v as u8);
+            if let Some(d) = self.depths.get_mut(&(regs[REG_DEPTH_INFO] & 0xFFF)) {
+                d.z.iter_mut().for_each(|p| *p = z);
+                d.s.iter_mut().for_each(|p| *p = st);
             }
         }
         self.resolves += 1;
@@ -509,11 +854,16 @@ impl Renderer {
         let mut skipped: Vec<_> = self.skipped.iter().map(|(k, v)| format!("{k} x{v}")).collect();
         skipped.sort();
         format!(
-            "render: {} draws, {} triangles, {} pixels shaded, {} resolves; skipped: {}",
+            "render: {} draws, {} triangles, {} verts, {} pixels shaded, {} resolves | host time: draws {:.1?} (vertex {:.1?}, raster {:.1?}), resolves {:.1?}; skipped: {}",
             self.draws_rasterized,
             self.triangles,
+            self.verts_shaded,
             self.pixels_shaded,
             self.resolves,
+            self.t_draw,
+            self.t_vertex,
+            self.t_raster,
+            self.t_resolve,
             if skipped.is_empty() { "nothing".to_string() } else { skipped.join(", ") }
         )
     }

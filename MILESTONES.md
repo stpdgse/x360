@@ -124,6 +124,20 @@ dumps what r4/r6 point at, byte-store aware `X360_WATCH_MEM`, scheduler/kernel/G
 - Tooling: `X360_TRACE_CALLS=N,M` (instruction trace of the Nth visit to the `X360_WATCH` pc, main thread only),
   `cargo build --profile fast` for quick rebuilds.
 
+## Renderer rework (after the predication fix)
+- **Loading screen renders correctly past frame 9604** (GTA IV artwork). The frames after ~9620 are black; the game draws
+  ~835 draws/frame (z-prepass, 16x16 visibility-query points, a 992-triangle lighting pass) and nothing reaches the front buffer yet.
+- RB_MODECONTROL was misread: **4 = colour+depth draw, 5 = depth-only draw, 6 = EDRAM copy (resolve)**. Resolves now run on mode 6,
+  restricted to the window-scissor rectangle (per-tile copies and clears only touch their own rows); mode-5 draws no longer resolve.
+- Predicated tiling uses one full-frame surface: tile scissors are absolute frame rows, so surfaces now grow to cover the scissor.
+- **Depth/stencil** (f32 depth + 8-bit stencil per EDRAM depth base, early test, depth clear on resolve), a depth-only fast path,
+  decoded-texture cache validated by content hash (`xenos_texcache.rs`), `X360_RENDER_SCALE` (e.g. 0.5) for fast development frames,
+  quicker resolves. Profile of the loading-screen phase: 496k draws, 16.6 G pixels shaded, 1110 s raster, 122 s resolves.
+- Remaining cost is the interpreted pixel shader (~3 us/pixel for the 100+ op lighting shaders, 7-30 M pixels per draw).
+  Next: pre-decoded, batched (SoA, lockstep) pixel shader execution.
+- Debug: `X360_LOG_SLOW_DRAWS=1|2`, `X360_STATUS_RENDER=1`, `X360_SAMPLE_DRAWS=1` (now with frame number and state), `X360_LOG_RESOLVES`,
+  `X360_LOG_TILE_REGS`, `X360_PRED_HIST`.
+
 ## BREAKTHROUGH: predicated tiling (frame 9604 stall solved)
 - Root cause: the CP ignored **PM4 predication**. Type-3 packets with the predicate bit (header bit 0) must only run when
   `BIN_SELECT & BIN_MASK != 0`. The driver's per-tile epilogue IB (scratch callback, waits, INTERRUPT) is masked to bit 31,

@@ -173,6 +173,23 @@ impl GuestMemory {
     }
 
     /// A read of `addr` that doesn't trip the read watch (for the watch's own report).
+    /// Bulk copy out of guest memory (page by page, no fault tracking; unmapped pages read as zero).
+    /// Physical-view addresses (0xA0000000 | phys) are the ones the renderer uses for textures.
+    pub fn read_bytes(&self, addr: u32, out: &mut [u8]) {
+        let mut done = 0usize;
+        while done < out.len() {
+            let a = addr.wrapping_add(done as u32);
+            let page = a as usize / PAGE;
+            let off = a as usize % PAGE;
+            let n = (PAGE - off).min(out.len() - done);
+            match self.pages.get(page).and_then(|p| p.as_ref()) {
+                Some(p) => out[done..done + n].copy_from_slice(&p[off..off + n]),
+                None => out[done..done + n].fill(0),
+            }
+            done += n;
+        }
+    }
+
     pub fn read32_unwatched(&self, addr: u32) -> u32 {
         match &self.pages[addr as usize / PAGE] {
             Some(p) => {

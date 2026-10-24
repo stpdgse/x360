@@ -23,6 +23,7 @@ mod window;
 mod xam;
 mod xenos_draw;
 mod xenos_tex;
+mod xenos_texcache;
 mod xenos_vm;
 mod xex;
 
@@ -344,6 +345,9 @@ fn main() {
             let _ = total;
             let share: Vec<String> = top.iter().take(6).map(|(id, n, k)| format!("t{id}{k}:{:.1}G", *n as f64 / 1e9)).collect();
             println!("[status] busiest threads (cumulative instrs): {}", share.join(" "));
+            if std::env::var_os("X360_STATUS_RENDER").is_some() {
+                println!("[status] {}", kernel.gpu.renderer.summary());
+            }
             println!(
                 "[status] {:.1}G instrs | vsync {} frames {} | gpu packets {} draws {} | kernel calls {} | io {:.1} MB | live threads {} | virtual {:.0}s",
                 steps as f64 / 1e9, kernel.vsyncs, kernel.gpu.frames, kernel.gpu.packets,

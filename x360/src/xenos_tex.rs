@@ -9,7 +9,7 @@ use xenon_cpu::memory::Bus;
 pub const REG_FETCH_CONSTS: usize = 0x4800;
 
 /// A decoded texture fetch constant (6 dwords per slot).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TexDesc {
     pub base_phys: u32,
     pub width: u32,
@@ -47,7 +47,7 @@ impl TexDesc {
     }
 
     /// (block width/height in texels, bytes per element, log2 bytes per element)
-    fn layout(&self) -> Option<(u32, u32, u32)> {
+    pub(crate) fn layout(&self) -> Option<(u32, u32, u32)> {
         Some(match self.format {
             2 | 8 | 9 => (1, 1, 0),                // 8-bit single channel
             3 | 4 | 5 | 10 | 15 | 24 => (1, 2, 1), // 16-bit packed / two 8-bit
@@ -59,12 +59,12 @@ impl TexDesc {
     }
 }
 
-fn expand565(c: u16) -> [f32; 3] {
+pub(crate) fn expand565(c: u16) -> [f32; 3] {
     [((c >> 11) & 31) as f32 / 31.0, ((c >> 5) & 63) as f32 / 63.0, (c & 31) as f32 / 31.0]
 }
 
 /// Decode a DXT block (given as canonical little-endian bytes) and return texel (x, y) in [0,4).
-fn dxt_texel(kind: u32, block: &[u8; 16], x: u32, y: u32) -> [f32; 4] {
+pub(crate) fn dxt_texel(kind: u32, block: &[u8; 16], x: u32, y: u32) -> [f32; 4] {
     // colour block: DXT1 occupies the first 8 bytes, DXT3/5 the last 8
     let cb = if kind == 18 { &block[0..8] } else { &block[8..16] };
     let c0 = u16::from_le_bytes([cb[0], cb[1]]);
@@ -172,7 +172,7 @@ impl TextureSampler<'_> {
         }
     }
 
-    fn wrap(coord: i64, size: u32, mode: u32) -> u32 {
+    pub(crate) fn wrap(coord: i64, size: u32, mode: u32) -> u32 {
         let s = size as i64;
         match mode {
             0 => coord.rem_euclid(s) as u32, // repeat
