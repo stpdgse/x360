@@ -21,6 +21,8 @@ mod snapshot;
 mod vm;
 mod window;
 mod xam;
+mod xenos_batch;
+mod xenos_batch_exec;
 mod xenos_draw;
 mod xenos_tex;
 mod xenos_texcache;

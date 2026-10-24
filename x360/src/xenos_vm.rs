@@ -486,7 +486,7 @@ impl<'a> Vm<'a> {
             8 => per(&|i| a[i] - a[i].floor()),
             9 => per(&|i| a[i].trunc()),
             10 => per(&|i| a[i].floor()),
-            11 => per(&|i| a[i].mul_add(b[i], c[i])),
+            11 => per(&|i| a[i] * b[i] + c[i]),
             12 => per(&|i| if a[i] == 0.0 { b[i] } else { c[i] }),
             13 => per(&|i| if a[i] >= 0.0 { b[i] } else { c[i] }),
             14 => per(&|i| if a[i] > 0.0 { b[i] } else { c[i] }),

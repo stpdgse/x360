@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::gpu::{tiled_offset_2d, PHYS_VIEW};
 use crate::memory::GuestMemory;
 use crate::xenos_tex::{TexDesc, TextureSampler};
+use crate::xenos_batch::{Batch, CompiledPs, LANES};
 use crate::xenos_texcache::{DecodedTex, TexCache};
 use std::sync::{Arc, Mutex, OnceLock};
 use crate::xenos_vm::{Consts, Invocation, ShaderIo, ShaderKind, TextureFetch, VertexFetch, Vm};
@@ -39,6 +40,59 @@ const REG_STENCILREFMASK: usize = 0x210D;
 const REG_VPORT_ZSCALE: usize = 0x2113;
 const REG_VPORT_ZOFFSET: usize = 0x2114;
 const REG_DEPTH_CLEAR: usize = 0x231D;
+
+thread_local! {
+    static BATCH_POOL: std::cell::RefCell<Vec<Batch>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn take_batch() -> Batch {
+    BATCH_POOL.with(|p| p.borrow_mut().pop()).unwrap_or_else(Batch::new)
+}
+
+fn give_batch(b: Batch) {
+    BATCH_POOL.with(|p| p.borrow_mut().push(b));
+}
+
+/// A covered pixel waiting for the batched shader: index into the band's rows and its interpolated depth.
+#[derive(Clone, Copy, Default)]
+struct PendPx {
+    di: usize,
+    pz: f32,
+}
+
+/// X360_VERIFY_BATCH=1: run every batch through the reference interpreter too and report differences.
+fn verify_batch(ps_vm: &Vm<'_>, io: &mut GpuIo<'_>, batch: &Batch, interp: &[[[f32; 4]; 16]], n: usize, ps: &[u32]) {
+    static REPORTED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    static CHECKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    for l in 0..n {
+        let mut inv = Invocation::new();
+        for k in 0..16 {
+            inv.r[k] = interp[l][k];
+        }
+        let err = ps_vm.run(&mut inv, io).is_err();
+        let killed_ref = err || inv.killed;
+        let killed_batch = (batch.killed >> l) & 1 != 0;
+        CHECKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut bad = killed_ref != killed_batch;
+        if !bad && !killed_ref {
+            for ch in 0..4 {
+                let (x, y) = (inv.exports.colors[0][ch], batch.colors[0][ch][l]);
+                if !(x == y || (x - y).abs() <= 1e-3 * x.abs().max(y.abs()).max(1.0) || (x.is_nan() && y.is_nan())) {
+                    bad = true;
+                }
+            }
+        }
+        if bad && REPORTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+            let h = ps.iter().fold(0xcbf29ce484222325u64, |a, w| (a ^ *w as u64).wrapping_mul(0x100000001b3));
+            println!(
+                "[batch MISMATCH] shader {h:016x} lane {l}: reference killed={killed_ref} colour={:?}; batch killed={killed_batch} colour={:?} (after {} checks)",
+                inv.exports.colors[0],
+                [batch.colors[0][0][l], batch.colors[0][1][l], batch.colors[0][2][l], batch.colors[0][3][l]],
+                CHECKED.load(std::sync::atomic::Ordering::Relaxed)
+            );
+        }
+    }
+}
 
 /// X360_RENDER_SCALE=0.5 renders at that fraction of the console resolution (resolves scale back up), a large
 /// speed-up for development. Default 1.0 = exact.
@@ -330,6 +384,10 @@ impl ShaderIo for GpuIo<'_> {
     }
 
     fn texture_fetch(&mut self, f: &TextureFetch, coords: [f32; 3]) -> [f32; 4] {
+        static NO_TEX: OnceLock<bool> = OnceLock::new();
+        if *NO_TEX.get_or_init(|| std::env::var_os("X360_DEBUG_NO_TEX").is_some()) {
+            return [0.5, 0.5, 0.5, 1.0]; // profiling aid: measure the shader without texture sampling
+        }
         if let Some(cache) = self.cache {
             let slot = self.slots[(f.constant & 31) as usize].get_or_init(|| {
                 let desc = TexDesc::from_regs(self.regs, f.constant);
@@ -647,10 +705,63 @@ impl Renderer {
         // Rasterize rows [y0, y1) of the surface into `rows` (the pixels of exactly those rows) for every
         // triangle, in order. Rows are independent, so large draws are split into bands run on separate
         // threads with results identical to the serial order. Returns pixels shaded.
+        // Compile the pixel shader once per draw (constants resolved, operands decoded) when it is worth it and uses
+        // only per-pixel-uniform control flow; otherwise pixels go through the reference interpreter one by one.
+        let compiled: Option<CompiledPs> = if !skip_ps && work >= 24 && std::env::var_os("X360_NO_BATCH").is_none() {
+            CompiledPs::compile(&ps, regs)
+        } else {
+            None
+        };
+        let verify = compiled.is_some() && std::env::var_os("X360_VERIFY_BATCH").is_some();
+
         let shade_rows = |y0: i32, y1: i32, rows: &mut [[f32; 4]], mut drows: Option<(&mut [f32], &mut [u8])>| -> u64 {
             let mut io = GpuIo { mem, regs, cache: if use_cache { Some(tex_cache) } else { None }, slots: &slots };
             let mut shaded = 0u64;
             let (mut covered_local, mut rej_s_local, mut rej_z_local) = (0u64, 0u64, 0u64);
+            let mut batch = take_batch();
+            let mut pend: [PendPx; LANES] = [PendPx::default(); LANES];
+            let mut npend = 0usize;
+            let mut interp_copy: Vec<[[f32; 4]; 16]> = if verify { vec![[[0.0; 4]; 16]; LANES] } else { Vec::new() };
+            let ninterp = compiled.as_ref().map(|c| c.ninterp).unwrap_or(16);
+
+            // Run the compiled shader on the pending pixels and finish them in order (stencil/depth writes, blend).
+            macro_rules! flush {
+                () => {{
+                    if npend > 0 {
+                        let cp = compiled.as_ref().unwrap();
+                        cp.run(&mut batch, npend, &mut io);
+                        if verify {
+                            verify_batch(&ps_vm, &mut io, &batch, &interp_copy, npend, &ps);
+                        }
+                        for l in 0..npend {
+                            if (batch.killed >> l) & 1 != 0 {
+                                continue;
+                            }
+                            let pp = pend[l];
+                            shaded += 1;
+                            if let Some((zrow, srow)) = drows.as_mut() {
+                                if dstate.stencil_enable {
+                                    let n = stencil_op(dstate.s_zpass, srow[pp.di], dstate.s_ref);
+                                    srow[pp.di] = (srow[pp.di] & !dstate.s_wmask) | (n & dstate.s_wmask);
+                                }
+                                if dstate.z_enable && dstate.z_write {
+                                    zrow[pp.di] = pp.pz;
+                                }
+                            }
+                            let src = [batch.colors[0][0][l], batch.colors[0][1][l], batch.colors[0][2][l], batch.colors[0][3][l]];
+                            let dst = &mut rows[pp.di];
+                            let blended = blend(blend_ctl, src, *dst);
+                            for ch in 0..4 {
+                                if (write_mask >> ch) & 1 != 0 {
+                                    dst[ch] = blended[ch];
+                                }
+                            }
+                        }
+                        npend = 0;
+                    }
+                }};
+            }
+
             for t in &tri_idx {
                 let (a, b, c) = (verts[t[0]], verts[t[1]], verts[t[2]]);
                 let area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
@@ -661,10 +772,38 @@ impl Renderer {
                 let max_x = a.x.max(b.x).max(c.x).ceil().min(sx1.min(w) as f32) as i32;
                 let min_y = (a.y.min(b.y).min(c.y).floor().max(sy0.max(0) as f32) as i32).max(y0);
                 let max_y = (a.y.max(b.y).max(c.y).ceil().min(sy1.min(h) as f32) as i32).min(y1);
+                if min_x >= max_x || min_y >= max_y {
+                    continue;
+                }
                 let inv_area = 1.0 / area;
+                // barycentric weights are affine in x along a row: w_k = al_k * cx + be_k(cy)
+                let (al0, al1) = ((b.y - c.y) * inv_area, (c.y - a.y) * inv_area);
+                let al2 = -(al0 + al1);
                 for py in min_y..max_y {
-                    for px in min_x..max_x {
-                        let (cx, cy) = (px as f32 + 0.5, py as f32 + 0.5);
+                    let cy = py as f32 + 0.5;
+                    let be0 = (b.x * (c.y - cy) - (b.y - cy) * c.x) * inv_area;
+                    let be1 = (c.x * (a.y - cy) - (c.y - cy) * a.x) * inv_area;
+                    let be2 = 1.0 - be0 - be1;
+                    // pixel range where all three weights can be >= 0 (padded by one pixel for rounding; the exact
+                    // per-pixel test below decides coverage)
+                    let (mut lo, mut hi) = (f32::NEG_INFINITY, f32::INFINITY);
+                    let mut empty = false;
+                    for (al, be) in [(al0, be0), (al1, be1), (al2, be2)] {
+                        if al > 0.0 {
+                            lo = lo.max(-be / al);
+                        } else if al < 0.0 {
+                            hi = hi.min(-be / al);
+                        } else if be < 0.0 {
+                            empty = true;
+                        }
+                    }
+                    if empty || lo > hi + 1.0 {
+                        continue;
+                    }
+                    let row_min = if lo.is_finite() { ((lo - 0.5).floor() as i64 - 1).clamp(min_x as i64, max_x as i64) as i32 } else { min_x };
+                    let row_max = if hi.is_finite() { ((hi - 0.5).ceil() as i64 + 2).clamp(min_x as i64, max_x as i64) as i32 } else { max_x };
+                    for px in row_min..row_max {
+                        let cx = px as f32 + 0.5;
                         // barycentric weights (signed so both windings work)
                         let w0 = ((b.x - cx) * (c.y - cy) - (b.y - cy) * (c.x - cx)) * inv_area;
                         let w1 = ((c.x - cx) * (a.y - cy) - (c.y - cy) * (a.x - cx)) * inv_area;
@@ -696,17 +835,55 @@ impl Renderer {
                                 continue;
                             }
                         }
+                        if skip_ps {
+                            // depth-only pass: the shader has nothing to contribute
+                            shaded += 1;
+                            if let Some((zrow, srow)) = drows.as_mut() {
+                                if dstate.stencil_enable {
+                                    let n = stencil_op(dstate.s_zpass, srow[di], dstate.s_ref);
+                                    srow[di] = (srow[di] & !dstate.s_wmask) | (n & dstate.s_wmask);
+                                }
+                                if dstate.z_enable && dstate.z_write {
+                                    zrow[di] = pz;
+                                }
+                            }
+                            continue;
+                        }
                         // perspective-correct interpolation
                         let (p0, p1, p2) = (w0 * a.inv_w, w1 * b.inv_w, w2 * c.inv_w);
                         let denom = p0 + p1 + p2;
                         let (q0, q1, q2) = if denom != 0.0 { (p0 / denom, p1 / denom, p2 / denom) } else { (w0, w1, w2) };
+                        if compiled.is_some() {
+                            if npend == 0 {
+                                batch.reset(compiled.as_ref().unwrap().nregs);
+                            }
+                            let l = npend;
+                            for k in 0..ninterp {
+                                for ch in 0..4 {
+                                    batch.r[k][ch][l] = a.interp[k][ch] * q0 + b.interp[k][ch] * q1 + c.interp[k][ch] * q2;
+                                }
+                            }
+                            if verify {
+                                for k in 0..16 {
+                                    for ch in 0..4 {
+                                        interp_copy[l][k][ch] = a.interp[k][ch] * q0 + b.interp[k][ch] * q1 + c.interp[k][ch] * q2;
+                                    }
+                                }
+                            }
+                            pend[l] = PendPx { di, pz };
+                            npend += 1;
+                            if npend == LANES {
+                                flush!();
+                            }
+                            continue;
+                        }
                         let mut inv = Invocation::new();
                         for k in 0..16 {
                             for ch in 0..4 {
                                 inv.r[k][ch] = a.interp[k][ch] * q0 + b.interp[k][ch] * q1 + c.interp[k][ch] * q2;
                             }
                         }
-                        if !skip_ps && (ps_vm.run(&mut inv, &mut io).is_err() || inv.killed) {
+                        if ps_vm.run(&mut inv, &mut io).is_err() || inv.killed {
                             continue;
                         }
                         shaded += 1;
@@ -719,11 +896,8 @@ impl Renderer {
                                 zrow[di] = pz;
                             }
                         }
-                        if skip_ps {
-                            continue;
-                        }
                         let src = inv.exports.colors[0];
-                        let dst = &mut rows[((py - y0) * w + px) as usize];
+                        let dst = &mut rows[di];
                         let blended = blend(blend_ctl, src, *dst);
                         for ch in 0..4 {
                             if (write_mask >> ch) & 1 != 0 {
@@ -732,39 +906,40 @@ impl Renderer {
                         }
                     }
                 }
+                // finish this triangle's pixels before the next one so overlapping triangles keep their order
+                flush!();
             }
+            give_batch(batch);
             covered.fetch_add(covered_local, std::sync::atomic::Ordering::Relaxed);
             rej_s.fetch_add(rej_s_local, std::sync::atomic::Ordering::Relaxed);
             rej_z.fetch_add(rej_z_local, std::sync::atomic::Ordering::Relaxed);
             shaded
         };
 
-        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(8);
-        if threads > 1 && work > 40_000 && h >= threads as i32 {
-            let band = ((h as usize + threads - 1) / threads) as i32;
-            let shaded: u64 = std::thread::scope(|sc| {
-                let shade_rows = &shade_rows;
-                let chunk = (band * w) as usize;
-                let (mut zc, mut sc2): (Vec<Option<&mut [f32]>>, Vec<Option<&mut [u8]>>) = match depth.as_mut() {
-                    Some(d) => (d.z.chunks_mut(chunk).map(Some).collect(), d.s.chunks_mut(chunk).map(Some).collect()),
-                    None => (Vec::new(), Vec::new()),
-                };
-                let handles: Vec<_> = surf
-                    .px
-                    .chunks_mut(chunk)
-                    .enumerate()
-                    .map(|(k, rows)| {
-                        let y0 = k as i32 * band;
-                        let y1 = (y0 + band).min(h);
-                        let dr = match (zc.get_mut(k).and_then(|z| z.take()), sc2.get_mut(k).and_then(|s| s.take())) {
-                            (Some(z), Some(s)) => Some((z, s)),
-                            _ => None,
-                        };
-                        sc.spawn(move || shade_rows(y0, y1, rows, dr))
-                    })
-                    .collect();
-                handles.into_iter().map(|hd| hd.join().unwrap()).sum()
-            });
+        // Bands of a few rows are independent (every band runs all triangles in order over its own rows), so large
+        // draws are spread over the rayon pool with work stealing; small draws stay on this thread.
+        let threads = rayon::current_num_threads();
+        if threads > 1 && work > 20_000 && h >= 16 {
+            use rayon::prelude::*;
+            let band = ((h as usize / (threads * 8)).max(4)) as i32;
+            let chunk = (band * w) as usize;
+            let mut bands: Vec<(i32, &mut [[f32; 4]], Option<(&mut [f32], &mut [u8])>)> = Vec::new();
+            match depth.as_mut() {
+                Some(d) => {
+                    for (k, ((rows, z), st)) in surf.px.chunks_mut(chunk).zip(d.z.chunks_mut(chunk)).zip(d.s.chunks_mut(chunk)).enumerate() {
+                        bands.push((k as i32 * band, rows, Some((z, st))));
+                    }
+                }
+                None => {
+                    for (k, rows) in surf.px.chunks_mut(chunk).enumerate() {
+                        bands.push((k as i32 * band, rows, None));
+                    }
+                }
+            }
+            let shaded: u64 = bands
+                .into_par_iter()
+                .map(|(y0, rows, dr)| shade_rows(y0, (y0 + band).min(h), rows, dr))
+                .sum();
             self.pixels_shaded += shaded;
         } else {
             let dr = depth.as_mut().map(|d| (&mut d.z[..], &mut d.s[..]));

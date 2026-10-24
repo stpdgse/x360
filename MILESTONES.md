@@ -133,7 +133,13 @@ dumps what r4/r6 point at, byte-store aware `X360_WATCH_MEM`, scheduler/kernel/G
 - **Depth/stencil** (f32 depth + 8-bit stencil per EDRAM depth base, early test, depth clear on resolve), a depth-only fast path,
   decoded-texture cache validated by content hash (`xenos_texcache.rs`), `X360_RENDER_SCALE` (e.g. 0.5) for fast development frames,
   quicker resolves. Profile of the loading-screen phase: 496k draws, 16.6 G pixels shaded, 1110 s raster, 122 s resolves.
-- Remaining cost is the interpreted pixel shader (~3 us/pixel for the 100+ op lighting shaders, 7-30 M pixels per draw).
+- **Batched pixel shaders** (`xenos_batch.rs`, `xenos_batch_exec.rs`): shaders are compiled once per draw (constants and
+  bool-constant branches resolved, operands pre-decoded) and run 16 pixels in lockstep over structure-of-arrays registers,
+  with a runtime-dispatched AVX2 build. Loops/calls/jumps/relative addressing fall back to the reference interpreter.
+  `X360_VERIFY_BATCH=1` cross-checks every batch against the reference (0 mismatches on the loading-screen and first 3D
+  frames); `X360_NO_BATCH=1` disables it. Big draws now run on a persistent rayon pool in small row bands (work stealing)
+  instead of six fixed bands. The 992-triangle, 7.6 M pixel lighting draw: ~25 s -> ~1.7 s (half resolution).
+- (Before batching) remaining cost was the interpreted pixel shader (~3 us/pixel for the 100+ op lighting shaders, 7-30 M pixels per draw).
   Next: pre-decoded, batched (SoA, lockstep) pixel shader execution.
 - Debug: `X360_LOG_SLOW_DRAWS=1|2`, `X360_STATUS_RENDER=1`, `X360_SAMPLE_DRAWS=1` (now with frame number and state), `X360_LOG_RESOLVES`,
   `X360_LOG_TILE_REGS`, `X360_PRED_HIST`.
