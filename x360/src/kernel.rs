@@ -52,6 +52,9 @@ pub struct Kernel {
     pub picks: u64,
     /// Bytes read from the disc and host storage so far (for the status line).
     pub io_bytes: u64,
+    /// Debug: how many past-end-of-file read notes have been printed (not saved).
+    #[serde(skip)]
+    pub eof_notes: u32,
     /// Missing imports already reported under X360_STUB_MISSING.
     pub stubbed: std::collections::HashSet<String>,
     /// Thread-list slots whose (recyclable) thread has exited, available for the next spawn.
@@ -111,6 +114,7 @@ impl Kernel {
             cp_interrupts: 0,
             picks: 0,
             io_bytes: 0,
+            eof_notes: 0,
             stubbed: Default::default(),
             free_slots: Vec::new(),
             syscall_cycles: std::env::var("X360_SYSCALL_CYCLES").ok().and_then(|v| v.parse().ok()).unwrap_or(1500),

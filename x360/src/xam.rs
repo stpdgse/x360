@@ -182,6 +182,17 @@ impl XamState {
         Self::with_script(script)
     }
 
+    /// After loading a save state: take the scripted input from this run's environment (events already in the
+    /// past, counted in vsyncs, are dropped), not the saved run's.
+    pub fn reload_script(&mut self, now: u64) {
+        if let Ok(text) = std::env::var("X360_PAD") {
+            match parse_script(&text) {
+                Ok(v) => self.script = v.into_iter().filter(|e| e.0 > now).collect(),
+                Err(e) => eprintln!("X360_PAD ignored: {e}"),
+            }
+        }
+    }
+
     pub fn with_script(script: Vec<(u64, PadAction)>) -> Self {
         Self {
             signed_in: true,

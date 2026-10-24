@@ -133,6 +133,10 @@ impl Kernel {
                             _ => *pos,
                         };
                         if at >= entry.size as u64 && len > 0 {
+                            if self.eof_notes < 20 {
+                                self.eof_notes += 1;
+                                println!("note: NtReadFile past end of {} (size {:#x}): offset {at:#x}, length {len:#x}, explicit offset {:?}", entry.path, entry.size, explicit.map(|v| format!("{v:#x}")));
+                            }
                             io_status(mem, iosb, STATUS_END_OF_FILE, 0);
                             STATUS_END_OF_FILE
                         } else {

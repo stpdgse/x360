@@ -148,6 +148,10 @@ impl Kernel {
                 let path = path.clone();
                 let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                 let status = if at >= size && len > 0 {
+                    if self.eof_notes < 20 {
+                        self.eof_notes += 1;
+                        println!("note: host NtReadFile past end of {path:?} (size {size:#x}): offset {at:#x}, length {len:#x}");
+                    }
                     io_status(mem, iosb, STATUS_END_OF_FILE, 0);
                     STATUS_END_OF_FILE
                 } else {
@@ -155,6 +159,9 @@ impl Kernel {
                     let ok = std::fs::File::open(&path)
                         .and_then(|mut f| f.seek(SeekFrom::Start(at)).and_then(|_| f.read_exact(&mut data)))
                         .is_ok();
+                    if ok && std::env::var_os("X360_TRACE_IO").is_some() {
+                        println!("[io] host read {path:?} off={at:#x} len={len:#x}");
+                    }
                     if ok {
                         mem.write_bytes(buf, &data);
                         *self.objects.host_mut(h).unwrap().1 = at + data.len() as u64;

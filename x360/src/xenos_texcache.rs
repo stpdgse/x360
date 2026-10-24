@@ -178,6 +178,13 @@ impl TexCache {
         }
         self.decodes += 1;
         let tex = Arc::new(DecodedTex::decode(t, &words));
+        if tex.is_none() && std::env::var_os("X360_LOG_TEX_FORMATS").is_some() {
+            use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+            static SEEN: AtomicU32 = AtomicU32::new(0);
+            if SEEN.fetch_add(1, Relaxed) < 40 {
+                println!("[tex] unsupported texture format {} ({}x{} pitch {} tiled {} endian {}) at {:#x}", t.format, t.width, t.height, t.pitch, t.tiled, t.endian, t.base_phys);
+            }
+        }
         if self.map.len() > 512 {
             self.map.clear();
         }

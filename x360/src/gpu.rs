@@ -958,7 +958,7 @@ impl Gpu {
                 f32::from_bits(r(0x210F)), f32::from_bits(r(0x2110)), f32::from_bits(r(0x2111)), f32::from_bits(r(0x2112)), r(0x2204)
             );
         }
-        if mode == 6 && self.resolve_logged < 400 && std::env::var_os("X360_LOG_RESOLVES").is_some() {
+        if mode == 6 && self.resolve_logged < 4000 && std::env::var_os("X360_LOG_RESOLVES").is_some() {
             self.resolve_logged += 1;
             let r = &mem.gpu_regs;
             println!(

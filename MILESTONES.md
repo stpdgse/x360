@@ -124,6 +124,19 @@ dumps what r4/r6 point at, byte-store aware `X360_WATCH_MEM`, scheduler/kernel/G
 - Tooling: `X360_TRACE_CALLS=N,M` (instruction trace of the Nth visit to the `X360_WATCH` pc, main thread only),
   `cargo build --profile fast` for quick rebuilds.
 
+## After the loading screen (state of play)
+- **Black screen cause #1 (fixed)**: not rendering. The game read `cache1:\cuts.img` past its end because my killed runs left a partly
+  copied cache file (206 of 518 MB) next to a save state that assumed it was complete, so the title reported a dirty disc and
+  `XamShowDirtyDiscErrorUI` crashed us. `X360_COMPLETE_CACHE=1` rebuilds partial `hdd/cache*/` files from the disc image. Lesson:
+  save states depend on the `hdd/` contents; never kill a run mid-copy, or re-complete the cache first.
+- Renderer now also does: resolves with source select (colour 0-3 / depth), destination texel format + endian (8888, FP16, 32F,
+  2:10:10:10, D24/20e4 depth), multiple render targets, per-RT write masks and blend; `X360_PAD` now survives state loads.
+- With the cache repaired the game runs indefinitely (frames > 11,000, 76 G instructions, no crash, no deadlock), but sits in a
+  steady state: ~830 draws/frame, nearly all 16x16 visibility-query points and depth-only passes, no colour geometry, no disc I/O
+  after the scripts are read, front buffer black. Scripted START/A presses (vsync-timed) change nothing visible. Main thread
+  loops through its job system (14-way wait-all per frame). Next: find what the title's script/world code waits for.
+- Debug aids added: `X360_LOG_TEX_FORMATS`, host-file EOF notes, `X360_TRACE_IO` host reads, `X360_PAD` reload.
+
 ## Renderer rework (after the predication fix)
 - **Loading screen renders correctly past frame 9604** (GTA IV artwork). The frames after ~9620 are black; the game draws
   ~835 draws/frame (z-prepass, 16x16 visibility-query points, a 992-triangle lighting pass) and nothing reaches the front buffer yet.

@@ -127,6 +127,49 @@ fn main() {
         return;
     }
 
+    // X360_COMPLETE_CACHE=1: rebuild every partial file in the emulated hard drive's cache folders from the disc
+    // image (the title copies its .img archives there; a run killed mid-copy leaves short files, and a save state
+    // taken after the copy then sees a "dirty disc"), then exit.
+    if std::env::var_os("X360_COMPLETE_CACHE").is_some() {
+        match File::open(&path).map_err(|e| e.to_string()).and_then(|f| iso::Gdf::open(BufReader::new(f)).map_err(|e| e.to_string())) {
+            Ok(mut disc) => {
+                let root = hostfs::root();
+                let files: Vec<_> = disc.files.iter().filter(|f| !f.is_dir).cloned().collect();
+                let (mut fixed, mut checked) = (0, 0);
+                for dir in ["cache", "cache1"] {
+                    let Ok(rd) = std::fs::read_dir(root.join(dir)) else { continue };
+                    for ent in rd.flatten() {
+                        let name = ent.file_name().to_string_lossy().to_lowercase();
+                        let have = ent.metadata().map(|m| m.len()).unwrap_or(0);
+                        checked += 1;
+                        let Some(src) = files.iter().find(|f| f.path.to_lowercase().rsplit('/').next() == Some(name.as_str())) else { continue };
+                        if have == src.size as u64 {
+                            continue;
+                        }
+                        println!("completing {dir}/{name}: {have} -> {} bytes from {}", src.size, src.path);
+                        let mut out = Vec::with_capacity(src.size as usize);
+                        let mut off = 0u64;
+                        while off < src.size as u64 {
+                            let n = (1usize << 20).min((src.size as u64 - off) as usize);
+                            match disc.read_range(src, off, n) {
+                                Ok(d) if !d.is_empty() => {
+                                    off += d.len() as u64;
+                                    out.extend_from_slice(&d);
+                                }
+                                _ => break,
+                            }
+                        }
+                        let _ = std::fs::write(ent.path(), &out);
+                        fixed += 1;
+                    }
+                }
+                println!("cache check: {checked} files looked at, {fixed} rebuilt");
+            }
+            Err(e) => eprintln!("could not read disc: {e}"),
+        }
+        return;
+    }
+
     // X360_LIST_DISC=1 prints every file/directory on the disc and exits.
     if std::env::var_os("X360_LIST_DISC").is_some() {
         match File::open(&path).map_err(|e| e.to_string()).and_then(|f| iso::Gdf::open(BufReader::new(f)).map_err(|e| e.to_string())) {
@@ -239,6 +282,7 @@ fn main() {
                 kernel.trace_calls = std::env::var_os("X360_TRACE_KERNEL").is_some();
                 kernel.syscall_cycles = std::env::var("X360_SYSCALL_CYCLES").ok().and_then(|v| v.parse().ok()).unwrap_or(1500);
                 kernel.gpu.reload_env();
+                kernel.xam.reload_script(kernel.vsyncs);
                 if let Some(l) = &live {
                     kernel.gpu.window = Some(l.clone());
                     kernel.xam.live = Some(l.clone());

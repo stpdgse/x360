@@ -35,6 +35,9 @@ const REG_COPY_CONTROL: usize = 0x2318;
 const REG_COLOR_CLEAR: usize = 0x231E;
 const REG_VERTEX_FETCH_CONSTS: usize = 0x4800;
 const REG_DEPTH_INFO: usize = 0x2002;
+const REG_COPY_DEST_INFO: usize = 0x231B;
+/// RB_COLOR_INFO, RB_COLOR1_INFO, RB_COLOR2_INFO, RB_COLOR3_INFO
+const COLOR_INFO_REGS: [usize; 4] = [0x2001, 0x2003, 0x2004, 0x2005];
 const REG_DEPTHCONTROL: usize = 0x2200;
 const REG_STENCILREFMASK: usize = 0x210D;
 const REG_VPORT_ZSCALE: usize = 0x2113;
@@ -51,6 +54,10 @@ fn take_batch() -> Batch {
 
 fn give_batch(b: Batch) {
     BATCH_POOL.with(|p| p.borrow_mut().push(b));
+}
+
+fn take_ex<'b>(ex_chunks: &mut Vec<std::vec::IntoIter<&'b mut [[f32; 4]]>>) -> Vec<&'b mut [[f32; 4]]> {
+    ex_chunks.iter_mut().map(|it| it.next().unwrap()).collect()
 }
 
 /// A covered pixel waiting for the batched shader: index into the band's rows and its interpolated depth.
@@ -295,6 +302,94 @@ pub fn encode_endian(value: u32, mode: u32) -> u32 {
     }
 }
 
+/// f32 -> IEEE half bits (round to nearest even; values beyond the half range saturate to infinity).
+fn f32_to_f16(f: f32) -> u16 {
+    let bits = f.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xFF) as i32;
+    let man = bits & 0x7F_FFFF;
+    if exp == 0xFF {
+        return sign | 0x7C00 | if man != 0 { 0x200 } else { 0 };
+    }
+    let e = exp - 127 + 15;
+    if e >= 31 {
+        return sign | 0x7C00;
+    }
+    if e <= 0 {
+        if e < -10 {
+            return sign;
+        }
+        let m = man | 0x80_0000;
+        let shift = (14 - e) as u32;
+        let half = (m >> shift) as u16;
+        let round = (m >> (shift - 1)) & 1;
+        return sign | (half + round as u16);
+    }
+    let half = sign | ((e as u16) << 10) | (man >> 13) as u16;
+    let round = (man >> 12) & 1;
+    half.wrapping_add(round as u16)
+}
+
+/// Encode one render-target pixel as the texel format of a copy destination (TextureFormat numbering):
+/// returns the two little-endian dwords (the second only for 64-bit formats).
+fn encode_texel(format: u32, p: [f32; 4]) -> (u32, u32) {
+    let c8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u32;
+    match format {
+        // 16_16_FLOAT
+        31 => ((f32_to_f16(p[0]) as u32) | (f32_to_f16(p[1]) as u32) << 16, 0),
+        // 16_16_16_16_FLOAT
+        32 => (
+            (f32_to_f16(p[0]) as u32) | (f32_to_f16(p[1]) as u32) << 16,
+            (f32_to_f16(p[2]) as u32) | (f32_to_f16(p[3]) as u32) << 16,
+        ),
+        // 32_FLOAT
+        36 => (p[0].to_bits(), 0),
+        // 32_32_FLOAT
+        37 => (p[0].to_bits(), p[1].to_bits()),
+        // 2_10_10_10: A2 B10 G10 R10
+        10 => {
+            let c10 = |v: f32| (v.clamp(0.0, 1.0) * 1023.0 + 0.5) as u32;
+            (c10(p[0]) | c10(p[1]) << 10 | c10(p[2]) << 20 | ((p[3].clamp(0.0, 1.0) * 3.0 + 0.5) as u32) << 30, 0)
+        }
+        // 8_8_8_8 and anything we don't model: R in the lowest byte
+        _ => (c8(p[0]) | c8(p[1]) << 8 | c8(p[2]) << 16 | c8(p[3]) << 24, 0),
+    }
+}
+
+/// f32 in [0, 2) -> the Xenos 20e4 depth float (4-bit exponent with bias 3, 20-bit mantissa, no sign).
+pub fn f32_to_20e4(f: f32) -> u32 {
+    let f = if f.is_nan() { 0.0 } else { f.max(0.0) };
+    if f >= 2.0 {
+        return 0xFF_FFFF;
+    }
+    if f == 0.0 {
+        return 0;
+    }
+    let bits = f.to_bits();
+    let e4 = ((bits >> 23) & 0xFF) as i32 - 127 + 3;
+    if e4 <= 0 {
+        // denormal: value = mantissa / 2^20 * 2^-2
+        return ((f * 4_194_304.0 + 0.5) as u32).min(0xF_FFFF);
+    }
+    let mut m = ((bits & 0x7F_FFFF) + 4) >> 3;
+    let mut e = e4 as u32;
+    if m > 0xF_FFFF {
+        m = 0;
+        e += 1;
+    }
+    if e > 15 { 0xFF_FFFF } else { (e << 20) | m }
+}
+
+/// Inverse of [`f32_to_20e4`].
+pub fn decode_20e4(v: u32) -> f32 {
+    let (e, m) = ((v >> 20) & 0xF, v & 0xF_FFFF);
+    if e == 0 {
+        m as f32 / 1_048_576.0 * 0.25
+    } else {
+        (1.0 + m as f32 / 1_048_576.0) * 2f32.powi(e as i32 - 3)
+    }
+}
+
 fn f16_to_f32(h: u16) -> f32 {
     let sign = ((h >> 15) & 1) as u32;
     let exp = ((h >> 10) & 0x1F) as u32;
@@ -480,7 +575,11 @@ impl Renderer {
     }
 
     fn surface(&mut self, regs: &[u32]) -> &mut Surface {
-        let base = regs[REG_COLOR_INFO] & 0xFFF;
+        let key = regs[REG_COLOR_INFO] & 0xFFF;
+        self.surface_for(regs, key)
+    }
+
+    fn surface_for(&mut self, regs: &[u32], base: u32) -> &mut Surface {
         let br = regs[REG_WINDOW_SCISSOR_BR];
         let sc = render_scale();
         let (fw, fh) = ((br & 0x7FFF).clamp(1, 2560), ((br >> 16) & 0x7FFF).clamp(1, 1440));
@@ -668,6 +767,27 @@ impl Renderer {
         let (w, h) = (surf.width as i32, surf.height as i32);
         self.draws_rasterized += 1;
 
+        // Multiple render targets: colour outputs 1..3 go to their own surfaces (when their write mask is non-zero).
+        let mut extras: Vec<(usize, u32, u8, u32, Surface)> = Vec::new(); // (output, blend control, write mask, key, surface)
+        if !depth_only {
+            for k in 1..4usize {
+                let m = ((regs[REG_COLOR_MASK] >> (4 * k)) & 0xF) as u8;
+                let kk = regs[COLOR_INFO_REGS[k]] & 0xFFF;
+                if m == 0 || kk == key || extras.iter().any(|e| e.3 == kk) {
+                    continue;
+                }
+                let _ = self.surface_for(regs, kk);
+                if let Some(sf) = self.surfaces.remove(&kk) {
+                    if sf.width as i32 == w && sf.height as i32 == h {
+                        extras.push((k, regs[REG_BLENDCONTROL0 + k], m, kk, sf));
+                    } else {
+                        self.surfaces.insert(kk, sf); // size mismatch: leave it alone
+                    }
+                }
+            }
+        }
+        let ex_info: Vec<(usize, u32, u8)> = extras.iter().map(|e| (e.0, e.1, e.2)).collect();
+
         // depth/stencil target (only when the draw tests or writes it)
         let dstate = DepthState::from_regs(regs);
         let depth_key = regs[REG_DEPTH_INFO] & 0xFFF;
@@ -714,7 +834,7 @@ impl Renderer {
         };
         let verify = compiled.is_some() && std::env::var_os("X360_VERIFY_BATCH").is_some();
 
-        let shade_rows = |y0: i32, y1: i32, rows: &mut [[f32; 4]], mut drows: Option<(&mut [f32], &mut [u8])>| -> u64 {
+        let shade_rows = |y0: i32, y1: i32, rows: &mut [[f32; 4]], mut ex: Vec<&mut [[f32; 4]]>, mut drows: Option<(&mut [f32], &mut [u8])>| -> u64 {
             let mut io = GpuIo { mem, regs, cache: if use_cache { Some(tex_cache) } else { None }, slots: &slots };
             let mut shaded = 0u64;
             let (mut covered_local, mut rej_s_local, mut rej_z_local) = (0u64, 0u64, 0u64);
@@ -754,6 +874,16 @@ impl Renderer {
                             for ch in 0..4 {
                                 if (write_mask >> ch) & 1 != 0 {
                                     dst[ch] = blended[ch];
+                                }
+                            }
+                            for (j, &(k, bctl, mk)) in ex_info.iter().enumerate() {
+                                let src = [batch.colors[k][0][l], batch.colors[k][1][l], batch.colors[k][2][l], batch.colors[k][3][l]];
+                                let dst = &mut ex[j][pp.di];
+                                let blended = blend(bctl, src, *dst);
+                                for ch in 0..4 {
+                                    if (mk >> ch) & 1 != 0 {
+                                        dst[ch] = blended[ch];
+                                    }
                                 }
                             }
                         }
@@ -904,6 +1034,15 @@ impl Renderer {
                                 dst[ch] = blended[ch];
                             }
                         }
+                        for (j, &(k, bctl, mk)) in ex_info.iter().enumerate() {
+                            let dst = &mut ex[j][di];
+                            let blended = blend(bctl, inv.exports.colors[k], *dst);
+                            for ch in 0..4 {
+                                if (mk >> ch) & 1 != 0 {
+                                    dst[ch] = blended[ch];
+                                }
+                            }
+                        }
                     }
                 }
                 // finish this triangle's pixels before the next one so overlapping triangles keep their order
@@ -923,33 +1062,42 @@ impl Renderer {
             use rayon::prelude::*;
             let band = ((h as usize / (threads * 8)).max(4)) as i32;
             let chunk = (band * w) as usize;
-            let mut bands: Vec<(i32, &mut [[f32; 4]], Option<(&mut [f32], &mut [u8])>)> = Vec::new();
+            type Band<'b> = (i32, &'b mut [[f32; 4]], Vec<&'b mut [[f32; 4]]>, Option<(&'b mut [f32], &'b mut [u8])>);
+            let mut bands: Vec<Band> = Vec::new();
+            let mut ex_chunks: Vec<std::vec::IntoIter<&mut [[f32; 4]]>> =
+                extras.iter_mut().map(|e| e.4.px.chunks_mut(chunk).collect::<Vec<_>>().into_iter()).collect();
             match depth.as_mut() {
                 Some(d) => {
                     for (k, ((rows, z), st)) in surf.px.chunks_mut(chunk).zip(d.z.chunks_mut(chunk)).zip(d.s.chunks_mut(chunk)).enumerate() {
-                        bands.push((k as i32 * band, rows, Some((z, st))));
+                        let ex = take_ex(&mut ex_chunks);
+                        bands.push((k as i32 * band, rows, ex, Some((z, st))));
                     }
                 }
                 None => {
                     for (k, rows) in surf.px.chunks_mut(chunk).enumerate() {
-                        bands.push((k as i32 * band, rows, None));
+                        let ex = take_ex(&mut ex_chunks);
+                        bands.push((k as i32 * band, rows, ex, None));
                     }
                 }
             }
             let shaded: u64 = bands
                 .into_par_iter()
-                .map(|(y0, rows, dr)| shade_rows(y0, (y0 + band).min(h), rows, dr))
+                .map(|(y0, rows, ex, dr)| shade_rows(y0, (y0 + band).min(h), rows, ex, dr))
                 .sum();
             self.pixels_shaded += shaded;
         } else {
             let dr = depth.as_mut().map(|d| (&mut d.z[..], &mut d.s[..]));
-            self.pixels_shaded += shade_rows(0, h, &mut surf.px, dr);
+            let ex: Vec<&mut [[f32; 4]]> = extras.iter_mut().map(|e| &mut e.4.px[..]).collect();
+            self.pixels_shaded += shade_rows(0, h, &mut surf.px, ex, dr);
         }
         self.last_covered = covered.load(std::sync::atomic::Ordering::Relaxed);
         self.last_rej_s = rej_s.load(std::sync::atomic::Ordering::Relaxed);
         self.last_rej_z = rej_z.load(std::sync::atomic::Ordering::Relaxed);
         if let Some(d) = depth {
             self.depths.insert(depth_key, d);
+        }
+        for e in extras {
+            self.surfaces.insert(e.3, e.4);
         }
         self.surfaces.insert(key, surf);
         self.t_raster += t_r.elapsed();
@@ -968,7 +1116,6 @@ impl Renderer {
     }
 
     fn resolve_inner(&mut self, mem: &mut GuestMemory, regs: &[u32]) {
-        let key = regs[REG_COLOR_INFO] & 0xFFF;
         let dest = regs[REG_COPY_DEST_BASE] & 0x1FFF_F000;
         let pitch_h = regs[REG_COPY_DEST_PITCH];
         let (pitch, height) = (pitch_h & 0x3FFF, (pitch_h >> 16) & 0x3FFF);
@@ -976,35 +1123,80 @@ impl Renderer {
             self.skip("resolve without destination");
             return;
         }
-        let Some(surf) = self.surfaces.get(&key) else {
-            self.skip("resolve of a render target that was never drawn");
-            return;
-        };
-        let to8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u32;
-        let base = PHYS_VIEW | dest;
+        let control = regs[REG_COPY_CONTROL];
+        let src_select = control & 7; // 0..=3 colour render target, 4 = depth/stencil
+        let info = regs[REG_COPY_DEST_INFO];
+        let (endian, dest_format) = (info & 7, (info >> 7) & 0x3F);
+        let key = regs[COLOR_INFO_REGS[(src_select & 3) as usize]] & 0xFFF;
+        let depth_key = regs[REG_DEPTH_INFO] & 0xFFF;
+        let float_depth = (regs[REG_DEPTH_INFO] >> 16) & 1 != 0;
+
         let sc = render_scale();
         // Copy region = the window scissor (per-tile copies use their own rows), clipped to the destination size.
         let (tl, br) = (regs[REG_WINDOW_SCISSOR_TL], regs[REG_WINDOW_SCISSOR_BR]);
         let (rx0, ry0) = ((tl & 0x7FFF).min(pitch), ((tl >> 16) & 0x7FFF).min(height));
         let (rx1, ry1) = ((br & 0x7FFF).min(pitch), ((br >> 16) & 0x7FFF).min(height));
         let (rx0, ry0, rx1, ry1) = if rx1 <= rx0 || ry1 <= ry0 { (0, 0, pitch, height) } else { (rx0, ry0, rx1, ry1) };
-        let full_w = ((surf.width as f32 / sc).round() as u32).min(rx1);
-        let full_h = ((surf.height as f32 / sc).round() as u32).min(ry1);
-        for y in ry0..full_h {
-            let sy = (((y as f32 + 0.5) * sc) as u32).min(surf.height - 1);
-            let row = &surf.px[(sy * surf.width) as usize..((sy + 1) * surf.width) as usize];
-            for x in rx0..full_w {
-                let sx = (((x as f32 + 0.5) * sc) as u32).min(surf.width - 1);
-                let p = row[sx as usize];
-                // bytes in memory order R, G, B, A (endian "none")
-                let bytes = [to8(p[0]) as u8, to8(p[1]) as u8, to8(p[2]) as u8, to8(p[3]) as u8];
-                mem.write32(base + tiled_offset_2d(x, y, pitch, 2), u32::from_be_bytes(bytes));
+
+        // texel size of the destination format
+        let dwords = match dest_format {
+            32 | 15 | 38 | 37 => 2, // 16_16_16_16_FLOAT, 16_16_16_16, 32_32_FLOAT, 32_32...
+            _ => 1,
+        };
+        let log_bpp = if dwords == 2 { 3 } else { 2 };
+        let base = PHYS_VIEW | dest;
+
+        // gather the source as a closure returning (r, g, b, a) or depth+stencil per destination pixel
+        if src_select == 4 {
+            let Some(d) = self.depths.get(&depth_key) else {
+                self.skip("resolve of a depth target that was never drawn");
+                return;
+            };
+            let full_w = ((d.width as f32 / sc).round() as u32).min(rx1);
+            let full_h = ((d.height as f32 / sc).round() as u32).min(ry1);
+            for y in ry0..full_h {
+                let sy = (((y as f32 + 0.5) * sc) as u32).min(d.height - 1);
+                for x in rx0..full_w {
+                    let sx = (((x as f32 + 0.5) * sc) as u32).min(d.width - 1);
+                    let i = (sy * d.width + sx) as usize;
+                    let z = d.z[i];
+                    let depth24 = if float_depth { f32_to_20e4(z) } else { (z.clamp(0.0, 1.0) * 16_777_215.0 + 0.5) as u32 };
+                    let word = (depth24 << 8) | d.s[i] as u32;
+                    mem.write32(base + tiled_offset_2d(x, y, pitch, log_bpp), encode_endian(word, endian));
+                }
+            }
+        } else {
+            let Some(surf) = self.surfaces.get(&key) else {
+                self.skip("resolve of a render target that was never drawn");
+                return;
+            };
+            let full_w = ((surf.width as f32 / sc).round() as u32).min(rx1);
+            let full_h = ((surf.height as f32 / sc).round() as u32).min(ry1);
+            for y in ry0..full_h {
+                let sy = (((y as f32 + 0.5) * sc) as u32).min(surf.height - 1);
+                let row = &surf.px[(sy * surf.width) as usize..((sy + 1) * surf.width) as usize];
+                for x in rx0..full_w {
+                    let sx = (((x as f32 + 0.5) * sc) as u32).min(surf.width - 1);
+                    let (d0, d1) = encode_texel(dest_format, row[sx as usize]);
+                    let off = base + tiled_offset_2d(x, y, pitch, log_bpp);
+                    mem.write32(off, encode_endian(d0, endian));
+                    if dwords == 2 {
+                        mem.write32(off + 4, encode_endian(d1, endian));
+                    }
+                }
             }
         }
-        // optional colour clear after the copy
-        if regs[REG_COPY_CONTROL] & (1 << 8) != 0 {
-            let c = regs[REG_COLOR_CLEAR];
-            let clear = [(c & 0xFF) as f32 / 255.0, ((c >> 8) & 0xFF) as f32 / 255.0, ((c >> 16) & 0xFF) as f32 / 255.0, (c >> 24) as f32 / 255.0];
+
+        // optional colour clear after the copy (the clear value is in the target's own format)
+        if control & (1 << 8) != 0 && src_select != 4 {
+            let (lo, hi) = (regs[REG_COLOR_CLEAR], regs[REG_COLOR_CLEAR + 1]);
+            let fmt = (regs[COLOR_INFO_REGS[(src_select & 3) as usize]] >> 16) & 0xF;
+            let clear = match fmt {
+                // 16_16_FLOAT / 16_16_16_16_FLOAT render targets: four halves in the two clear registers
+                6 | 7 => [f16_to_f32(lo as u16), f16_to_f32((lo >> 16) as u16), f16_to_f32(hi as u16), f16_to_f32((hi >> 16) as u16)],
+                14 | 15 => [f32::from_bits(lo), f32::from_bits(hi), 0.0, 0.0],
+                _ => [(lo & 0xFF) as f32 / 255.0, ((lo >> 8) & 0xFF) as f32 / 255.0, ((lo >> 16) & 0xFF) as f32 / 255.0, (lo >> 24) as f32 / 255.0],
+            };
             if let Some(s) = self.surfaces.get_mut(&key) {
                 let (cx0, cx1) = (((rx0 as f32 * sc) as u32).min(s.width), (((rx1 as f32 * sc).ceil()) as u32).min(s.width));
                 let (cy0, cy1) = (((ry0 as f32 * sc) as u32).min(s.height), (((ry1 as f32 * sc).ceil()) as u32).min(s.height));
@@ -1014,12 +1206,18 @@ impl Renderer {
             }
         }
         // optional depth/stencil clear after the copy
-        if regs[REG_COPY_CONTROL] & (1 << 9) != 0 {
+        if control & (1 << 9) != 0 {
             let v = regs[REG_DEPTH_CLEAR];
-            let (z, st) = ((v >> 8) as f32 / 16_777_215.0, v as u8);
-            if let Some(d) = self.depths.get_mut(&(regs[REG_DEPTH_INFO] & 0xFFF)) {
-                d.z.iter_mut().for_each(|p| *p = z);
-                d.s.iter_mut().for_each(|p| *p = st);
+            let z = if float_depth { decode_20e4(v >> 8) } else { (v >> 8) as f32 / 16_777_215.0 };
+            let st = v as u8;
+            if let Some(d) = self.depths.get_mut(&depth_key) {
+                let (cx0, cx1) = (((rx0 as f32 * sc) as u32).min(d.width), (((rx1 as f32 * sc).ceil()) as u32).min(d.width));
+                let (cy0, cy1) = (((ry0 as f32 * sc) as u32).min(d.height), (((ry1 as f32 * sc).ceil()) as u32).min(d.height));
+                for y in cy0..cy1 {
+                    let (a, b) = ((y * d.width + cx0) as usize, (y * d.width + cx1) as usize);
+                    d.z[a..b].iter_mut().for_each(|p| *p = z);
+                    d.s[a..b].iter_mut().for_each(|p| *p = st);
+                }
             }
         }
         self.resolves += 1;
@@ -1063,6 +1261,19 @@ mod tests {
                 assert_eq!(apply_endian(encode_endian(v, mode), mode), v, "mode {mode} value {v:#x}");
             }
         }
+    }
+
+    #[test]
+    fn half_and_20e4_round_trip() {
+        for v in [0.0f32, 0.5, 1.0, -2.0, 3.25, 0.000061, 65504.0] {
+            let back = f16_to_f32(f32_to_f16(v));
+            assert!((back - v).abs() <= v.abs() * 1e-3 + 1e-6, "{v} -> {back}");
+        }
+        for v in [0.0f32, 1e-5, 0.25, 0.5, 0.999, 1.0, 1.5, 1.99] {
+            let back = decode_20e4(f32_to_20e4(v));
+            assert!((back - v).abs() <= v * 1e-5 + 1e-6, "{v} -> {back}");
+        }
+        assert_eq!(f32_to_20e4(5.0), 0xFF_FFFF);
     }
 
     #[test]
